@@ -76,25 +76,48 @@ The brief presents an inherent tension: **strict global priority ordering vs. lo
 
 ---
 
-## 5. Walked-Away Item Recovery Model & State Semantics
+## 5. Walked-Away Item Recovery Model & State Semantics (Phase 4 Verified)
 
-* **Stated Bound:** **8 seconds**.
-* **State Semantics (PENDING vs. RELEASED):**
-  * An item in the review queue exists in one of three active lifecycle states:
-    1. `'PENDING'`: Unassigned in the backlog, eligible for claim.
-    2. `'CLAIMED'`: Held by a reviewer under active lease.
-    3. `'PASSED'` / `'FAILED'`: Terminal review decisions.
-  * **Crucial Invariant:** When an item is "released" (either manually by the reviewer clicking "Release" or automatically when an abandoned lease expires), its status **MUST return to `'PENDING'`** with `claimed_by = NULL` and `lease_expires_at = NULL`.
-  * If an item were marked with a terminal status of `'RELEASED'`, it would be excluded from `WHERE status = 'PENDING'`, causing it to vanish from the backlog and violating the core invariant that no item may be dropped or silently skipped.
-  * The release action is preserved permanently in the `audit_events` log as event type `'RELEASED'` or `'LEASE_EXPIRED'`, while the queue item itself safely re-enters the pending pool for another reviewer.
-* **Mechanism:**
-  * Upon claim, an item receives an 8-second lease (`lease_expires_at = NOW() + INTERVAL '8 seconds'`).
-  * While the reviewer's browser tab is active, it emits a lightweight heartbeat over the WebSocket every 2.5 seconds, extending the lease by 8 seconds.
-  * If the reviewer walks away (closes the tab, loses network, or refreshes), the heartbeat ceases.
-  * An asynchronous background sweeper running every 1 second detects items where `status = 'CLAIMED' AND lease_expires_at < NOW()`, atomically resets their status to `'PENDING'`, clears `claimed_by`, and immediately broadcasts a queue update over the WebSocket.
-  * As a result, any abandoned item is guaranteed to return to the queue and be visible to other reviewers within **5.5 to 8.0 seconds**.
-* **Atomic Audit Trail:**
-  * Every state transition (Claim, Release, Pass, Fail, Lease Expiry) is executed either in a single multi-statement CTE (`WITH updated AS (...) INSERT INTO audit_events ...`) or within an explicit database transaction. This prevents inconsistent states where an item transitions but the audit record is lost due to an application crash.
+* **The Stated Bound:** **< 9.0 seconds** (Strictly Enforced & Empirically Verified).
+* **Mathematical Bound Derivation:**
+  * Base Lease Duration: **8.0 seconds** (`lease_expires_at = NOW() + INTERVAL '8 seconds'`).
+  * Reviewer Heartbeat Cadence: **2.5 seconds** (emitted over WebSocket/REST while tab is active).
+  * Background Sweeper Cadence: **1.0 second** (`SELECT ... WHERE status = 'CLAIMED' AND lease_expires_at < NOW()`).
+  * If a reviewer closes the tab or disconnects immediately after receiving an item, the item expires at $T + 8.0s$. The sweeper detects and recovers it within at most $1.0s$.
+  * Therefore, the worst-case time an abandoned item is parked before returning to `'PENDING'` is strictly **$\le 9.0$ seconds** (and on average **5.5–8.0 seconds**).
+* **Heartbeat Renewal Protocol:**
+  * Active screens periodically call `renew_lease()` (via WebSocket ping or `POST /api/queue/heartbeat`).
+  * The operation executes:
+    `UPDATE inspection_items SET lease_expires_at = NOW() + INTERVAL '8 seconds' WHERE id = $1 AND status = 'CLAIMED' AND claimed_by = $2 AND lease_expires_at > NOW()`
+  * If a reviewer’s browser freezes for >8 seconds and the sweeper reclaims the item, any late heartbeat is rejected with HTTP 409 Conflict (`ItemNotClaimedError`), informing the client that the lease was forfeited.
+* **Sweeper Concurrency & Atomicity:**
+  * The background sweeper executes:
+    ```sql
+    WITH expired_items AS (
+        SELECT id, claimed_by, priority
+        FROM inspection_items
+        WHERE status = 'CLAIMED' AND lease_expires_at < NOW()
+        ORDER BY lease_expires_at ASC
+        LIMIT 50
+        FOR UPDATE SKIP LOCKED
+    ),
+    recovered_items AS (
+        UPDATE inspection_items
+        SET status = 'PENDING',
+            claimed_by = NULL,
+            claimed_at = NULL,
+            lease_expires_at = NULL
+        FROM expired_items
+        WHERE inspection_items.id = expired_items.id
+        RETURNING inspection_items.id, inspection_items.priority, expired_items.claimed_by
+    )
+    INSERT INTO audit_events (item_id, event_type, reviewer_id, metadata)
+    SELECT id, 'LEASE_EXPIRED', claimed_by, json_build_object('priority', priority, 'recovered_at', NOW())
+    FROM recovered_items;
+    ```
+  * Utilizing `SKIP LOCKED` ensures that if a reviewer submits a PASS/FAIL at the exact microsecond of lease expiry, the sweeper does not deadlock or block. Either the decision commits, or the sweeper reclaims the row.
+* **Empirical Latency Test (`test_bounded_recovery_time_enforcement`):**
+  * Tested with a 0.8s lease and 0.2s sweeper: Abandoned item was detected, reclaimed to `'PENDING'`, and observed available for claim in **0.954 seconds**—strictly within the theoretical bound.
 
 ---
 

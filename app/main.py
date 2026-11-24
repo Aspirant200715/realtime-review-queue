@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.db import init_db_pool, close_db_pool, get_db_pool
 from app.generator import generator_service
-from app.queue import queue_engine, ItemNotClaimedError, QueueError
+from app.queue import queue_engine, lease_sweeper_service, ItemNotClaimedError, QueueError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,6 +44,11 @@ class ReleaseRequest(BaseModel):
     reason: Optional[str] = Field("voluntary_release", max_length=200)
 
 
+class HeartbeatRequest(BaseModel):
+    item_id: str = Field(..., min_length=1, max_length=64)
+    reviewer_id: str = Field(..., min_length=1, max_length=64)
+
+
 # -------------------------------------------------------------
 # Lifespan
 # -------------------------------------------------------------
@@ -56,12 +61,15 @@ async def lifespan(app: FastAPI):
         logger.info("Database pool initialized and schema verified.")
         generator_service.set_pool(pool)
         queue_engine.set_pool(pool)
+        lease_sweeper_service.start()
     except Exception as e:
         logger.error(f"Failed to connect to database on startup: {e}")
         raise e
 
     yield
 
+    logger.info("Stopping lease sweeper...")
+    lease_sweeper_service.stop()
     logger.info("Stopping load generator if running...")
     generator_service.stop()
     logger.info("Closing database pool...")
@@ -169,6 +177,40 @@ async def release_item(req: ReleaseRequest):
     except Exception as e:
         logger.error(f"Error releasing item: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/queue/heartbeat")
+async def heartbeat(req: HeartbeatRequest):
+    """
+    Extends the active lease for a reviewer's currently claimed item.
+    """
+    try:
+        res = await queue_engine.renew_lease(req.item_id, req.reviewer_id)
+        return {"message": "Lease extended successfully", "data": res}
+    except ItemNotClaimedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error extending lease for {req.item_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/queue/sweep")
+async def trigger_sweep():
+    """
+    Triggers an immediate sweep of expired leases, returning abandoned items to PENDING.
+    """
+    try:
+        recovered = await queue_engine.sweep_expired_leases()
+        return {"recovered_count": len(recovered), "recovered_items": recovered}
+    except Exception as e:
+        logger.error(f"Error sweeping expired leases: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/queue/sweeper/status")
+async def get_sweeper_status():
+    """Returns telemetry of the background lease sweeper service."""
+    return lease_sweeper_service.get_metrics()
 
 
 @app.get("/api/queue/stats")

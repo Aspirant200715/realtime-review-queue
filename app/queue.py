@@ -379,6 +379,166 @@ class QueueEngine:
                 "next_preview": preview
             }
 
+    async def renew_lease(
+        self,
+        item_id: str,
+        reviewer_id: str,
+        extension_seconds: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """
+        Extends the lease expiration for an actively claimed item (heartbeat).
+        Guarantees only the reviewer actively holding the claim with an unexpired lease can renew it.
+        """
+        if not self.pool:
+            raise RuntimeError("Database pool not initialized.")
 
-# Singleton engine instance
+        duration = extension_seconds or self.lease_duration
+
+        async with self.pool.acquire() as conn:
+            renew_query = """
+            WITH target_item AS (
+                SELECT id FROM inspection_items
+                WHERE id = $1 AND status = 'CLAIMED' AND claimed_by = $2 AND lease_expires_at > NOW()
+                FOR UPDATE
+            ),
+            updated_item AS (
+                UPDATE inspection_items
+                SET lease_expires_at = NOW() + ($3 || ' seconds')::INTERVAL
+                FROM target_item
+                WHERE inspection_items.id = target_item.id
+                RETURNING inspection_items.id, inspection_items.claimed_by,
+                          inspection_items.lease_expires_at,
+                          ROUND(EXTRACT(EPOCH FROM (inspection_items.lease_expires_at - NOW()))::numeric, 2) AS remaining_lease_seconds
+            )
+            SELECT * FROM updated_item;
+            """
+            row = await conn.fetchrow(renew_query, item_id, reviewer_id, str(duration))
+
+            if not row:
+                current = await conn.fetchrow(
+                    "SELECT status, claimed_by, lease_expires_at FROM inspection_items WHERE id = $1;",
+                    item_id
+                )
+                if not current:
+                    raise ItemNotClaimedError(f"Item {item_id} does not exist.")
+                if current["status"] != "CLAIMED":
+                    raise ItemNotClaimedError(f"Item {item_id} is no longer claimed (status: {current['status']}).")
+                if current["claimed_by"] != reviewer_id:
+                    raise ItemNotClaimedError(f"Item {item_id} is claimed by {current['claimed_by']}, not {reviewer_id}.")
+                if current["lease_expires_at"] and current["lease_expires_at"] <= datetime.now(timezone.utc):
+                    raise ItemNotClaimedError(f"Lease for item {item_id} has already expired.")
+                raise ItemNotClaimedError(f"Cannot renew lease for item {item_id}.")
+
+            res = dict(row)
+            logger.debug(f"Lease renewed for item {item_id} by {reviewer_id}: {res['remaining_lease_seconds']}s remaining.")
+            return res
+
+    async def sweep_expired_leases(self, batch_size: int = 50) -> List[Dict[str, Any]]:
+        """
+        Scans for items where status = 'CLAIMED' AND lease_expires_at < NOW().
+        Atomically resets them to 'PENDING', clears claimed_by, and logs 'LEASE_EXPIRED' audit event.
+        Returns list of recovered items.
+        """
+        if not self.pool:
+            raise RuntimeError("Database pool not initialized.")
+
+        async with self.pool.acquire() as conn:
+            sweep_query = """
+            WITH expired_items AS (
+                SELECT id, claimed_by, priority
+                FROM inspection_items
+                WHERE status = 'CLAIMED' AND lease_expires_at < NOW()
+                ORDER BY lease_expires_at ASC
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            ),
+            recovered_items AS (
+                UPDATE inspection_items
+                SET status = 'PENDING',
+                    claimed_by = NULL,
+                    claimed_at = NULL,
+                    lease_expires_at = NULL
+                FROM expired_items
+                WHERE inspection_items.id = expired_items.id
+                RETURNING inspection_items.id, inspection_items.priority, expired_items.claimed_by
+            ),
+            logged_audit AS (
+                INSERT INTO audit_events (item_id, event_type, reviewer_id, metadata)
+                SELECT id, 'LEASE_EXPIRED', claimed_by, json_build_object(
+                    'priority', priority,
+                    'recovered_at', NOW()
+                )
+                FROM recovered_items
+                RETURNING id
+            )
+            SELECT id, priority, claimed_by FROM recovered_items;
+            """
+            rows = await conn.fetch(sweep_query, batch_size)
+
+        if rows:
+            recovered = [dict(r) for r in rows]
+            logger.warning(f"Sweeper recovered {len(recovered)} abandoned items: {[r['id'] for r in recovered]}")
+            await self._notify_listeners("LEASE_RECOVERED", {"recovered_items": recovered, "count": len(recovered)})
+            return recovered
+
+        return []
+
+
+class LeaseSweeper:
+    """
+    Background worker that runs periodic lease recovery sweeps.
+    Ensures abandoned items return to the queue within the bounded time.
+    """
+
+    def __init__(self, engine: QueueEngine, interval_seconds: float = settings.sweeper_interval_seconds):
+        self.engine = engine
+        self.interval = interval_seconds
+        self.is_running: bool = False
+        self._task: Optional[asyncio.Task] = None
+        self.total_sweeps: int = 0
+        self.total_recovered: int = 0
+        self.last_sweep_time: Optional[datetime] = None
+
+    async def _sweep_loop(self):
+        logger.info(f"Lease sweeper started. Running every {self.interval:.1f}s.")
+        while self.is_running:
+            try:
+                recovered = await self.engine.sweep_expired_leases()
+                self.total_sweeps += 1
+                self.last_sweep_time = datetime.now(timezone.utc)
+                if recovered:
+                    self.total_recovered += len(recovered)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in lease sweeper iteration: {e}")
+
+            await asyncio.sleep(self.interval)
+
+    def start(self):
+        if self.is_running:
+            return
+        self.is_running = True
+        self._task = asyncio.create_task(self._sweep_loop())
+        logger.info("Lease sweeper background task launched.")
+
+    def stop(self):
+        self.is_running = False
+        if self._task:
+            self._task.cancel()
+            self._task = None
+        logger.info("Lease sweeper stopped.")
+
+    def get_metrics(self) -> Dict[str, Any]:
+        return {
+            "is_running": self.is_running,
+            "interval_seconds": self.interval,
+            "total_sweeps": self.total_sweeps,
+            "total_recovered": self.total_recovered,
+            "last_sweep_time": self.last_sweep_time.isoformat() if self.last_sweep_time else None
+        }
+
+
+# Singleton engine and sweeper instances
 queue_engine = QueueEngine()
+lease_sweeper_service = LeaseSweeper(queue_engine)
