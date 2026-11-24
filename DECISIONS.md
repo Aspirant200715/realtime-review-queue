@@ -98,7 +98,25 @@ The brief presents an inherent tension: **strict global priority ordering vs. lo
 
 ---
 
-## 6. Verification & Empirical Results (Phase 1 Deep Dive)
+## 6. Load Generator Architecture & Traffic Shaping (Phase 2)
+
+* **Design Philosophy:**
+  * To honestly test the system under the specified strain, the generator must replicate both calm periods (~5 items/s) and sudden, disruptive floods (~250 items in <10 seconds) that outrun the review team.
+* **Item Priority Spread & Synthesis:**
+  * **Critical Defect (Priority 9–10, ~10%):** Structural fractures, through-wall porosity, delaminations with AI confidence 0.85–0.99.
+  * **High Severity (Priority 6–8, ~25%):** Weld undercuts, incomplete fusion, tolerance drifts with confidence 0.70–0.92.
+  * **Routine Inspection (Priority 1–5, ~65%):** Surface scuffs, minor burrs, coating variances with confidence 0.50–0.78.
+  * Ensures that priority ordering is genuinely meaningful and contended during bursts rather than uniform.
+* **Burst Shaping & Ingestion Velocity:**
+  * Dumps 250 items in micro-batches over 8.0 seconds (~31.25 items/sec), safely below the strict 10-second ceiling.
+  * Ingestion utilizes asynchronous transactions with pipelined `executemany` across both `inspection_items` and `audit_events`. A 250-item flood persists in <20 milliseconds of database time.
+* **Unpredictability & Controllability:**
+  * Runs continuous background bursts on randomized calm intervals (35s–75s) so reviewers meet floods mid-inspection.
+  * Provides synchronous and REST/CLI hooks (`POST /api/generator/burst`, `python scripts/run_generator.py --burst-now`) for deterministic evaluation and live video demonstration.
+
+---
+
+## 7. Verification & Empirical Results
 
 * **EXPLAIN ANALYZE Verification:**
   * Executed on a dataset of 2,500 mixed items (1,500 PENDING, 500 PASSED, 300 FAILED, 200 CLAIMED).
