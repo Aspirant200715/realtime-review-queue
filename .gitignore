@@ -1,0 +1,19 @@
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local tools & database cache
+.tools/
+logfile
+*.log
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
