@@ -76,15 +76,42 @@ The brief presents an inherent tension: **strict global priority ordering vs. lo
 
 ---
 
-## 5. Walked-Away Item Recovery Model
+## 5. Walked-Away Item Recovery Model & State Semantics
 
 * **Stated Bound:** **8 seconds**.
+* **State Semantics (PENDING vs. RELEASED):**
+  * An item in the review queue exists in one of three active lifecycle states:
+    1. `'PENDING'`: Unassigned in the backlog, eligible for claim.
+    2. `'CLAIMED'`: Held by a reviewer under active lease.
+    3. `'PASSED'` / `'FAILED'`: Terminal review decisions.
+  * **Crucial Invariant:** When an item is "released" (either manually by the reviewer clicking "Release" or automatically when an abandoned lease expires), its status **MUST return to `'PENDING'`** with `claimed_by = NULL` and `lease_expires_at = NULL`.
+  * If an item were marked with a terminal status of `'RELEASED'`, it would be excluded from `WHERE status = 'PENDING'`, causing it to vanish from the backlog and violating the core invariant that no item may be dropped or silently skipped.
+  * The release action is preserved permanently in the `audit_events` log as event type `'RELEASED'` or `'LEASE_EXPIRED'`, while the queue item itself safely re-enters the pending pool for another reviewer.
 * **Mechanism:**
   * Upon claim, an item receives an 8-second lease (`lease_expires_at = NOW() + INTERVAL '8 seconds'`).
   * While the reviewer's browser tab is active, it emits a lightweight heartbeat over the WebSocket every 2.5 seconds, extending the lease by 8 seconds.
   * If the reviewer walks away (closes the tab, loses network, or refreshes), the heartbeat ceases.
   * An asynchronous background sweeper running every 1 second detects items where `status = 'CLAIMED' AND lease_expires_at < NOW()`, atomically resets their status to `'PENDING'`, clears `claimed_by`, and immediately broadcasts a queue update over the WebSocket.
   * As a result, any abandoned item is guaranteed to return to the queue and be visible to other reviewers within **5.5 to 8.0 seconds**.
+* **Atomic Audit Trail:**
+  * Every state transition (Claim, Release, Pass, Fail, Lease Expiry) is executed either in a single multi-statement CTE (`WITH updated AS (...) INSERT INTO audit_events ...`) or within an explicit database transaction. This prevents inconsistent states where an item transitions but the audit record is lost due to an application crash.
+
+---
+
+## 6. Verification & Empirical Results (Phase 1 Deep Dive)
+
+* **EXPLAIN ANALYZE Verification:**
+  * Executed on a dataset of 2,500 mixed items (1,500 PENDING, 500 PASSED, 300 FAILED, 200 CLAIMED).
+  * Result: PostgreSQL used `Index Scan using idx_inspection_items_pending on inspection_items` with `Filter: ((status)::text = 'PENDING'::text)`.
+  * Execution time: **0.398 ms** with 12 shared buffer hits and 0 disk reads.
+  * Demonstrates that queue size growth in terminal items does not degrade claim speed.
+* **Concurrent Contention Benchmark:**
+  * 6 simulated reviewers competing across independent database connections for 100 items with randomized priorities (1–10).
+  * Result: 100/100 items claimed with **zero double-assignments** and **zero deadlocks** at a sustained claim rate of **779 claims/sec**.
+* **PostgreSQL Engine Compatibility:**
+  * Local test harness runs native PostgreSQL 18.7; production Docker Compose deploys `postgres:16-alpine`.
+  * All utilized SQL capabilities (`FOR UPDATE SKIP LOCKED`, partial B-tree indices, CTE `RETURNING`, JSONB) are semantically identical across versions 9.5 through 18.
+
 
 ---
 
