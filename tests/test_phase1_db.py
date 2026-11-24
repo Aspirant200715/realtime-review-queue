@@ -141,6 +141,8 @@ async def test_concurrent_claiming_zero_double_assignments():
                     break
                 async with lock:
                     claimed_ids.append(row["id"])
+                # Mark item processed so reviewer can claim next item under single active claim constraint
+                await conn.execute("UPDATE inspection_items SET status = 'PASSED', claimed_by = NULL WHERE id = $1;", row["id"])
                 await asyncio.sleep(0.002)
 
     # 6 concurrent workers competing

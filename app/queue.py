@@ -116,6 +116,11 @@ class QueueEngine:
         """
         Atomically claims the highest priority pending item for the reviewer.
         
+        Guarantees:
+        - Exactly-once handout via SELECT ... FOR UPDATE SKIP LOCKED.
+        - Strict single-active-item per reviewer: Immune to TOCTOU race conditions
+          even if the same reviewer makes simultaneous concurrent claim requests.
+        
         Returns:
             Tuple[item_dict, already_had_active_claim]
             - If reviewer already holds an active item, returns (active_item, True).
@@ -130,17 +135,25 @@ class QueueEngine:
             raise ValueError("Reviewer ID cannot be empty.")
 
         async with self.pool.acquire() as conn:
-            # 1. Check if reviewer already has an active, unexpired claim (idempotency guard)
+            # 1. Fast pre-check: if reviewer already holds an active claim, return it
             active = await self.get_active_claim_for_reviewer(reviewer_id, conn=conn)
             if active:
                 logger.info(f"Reviewer {reviewer_id} already holds active claim {active['id']}.")
                 return active, True
 
             # 2. Atomic claim via SELECT ... FOR UPDATE SKIP LOCKED CTE
+            # Includes reviewer_active CTE guard so simultaneous requests by the same reviewer
+            # never assign two items.
             claim_query = """
-            WITH next_item AS (
+            WITH reviewer_active AS (
+                SELECT id FROM inspection_items
+                WHERE claimed_by = $1 AND status = 'CLAIMED' AND lease_expires_at > NOW()
+                LIMIT 1
+            ),
+            next_item AS (
                 SELECT id FROM inspection_items
                 WHERE status = 'PENDING'
+                  AND NOT EXISTS (SELECT 1 FROM reviewer_active)
                 ORDER BY priority DESC, arrival_time ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -170,9 +183,20 @@ class QueueEngine:
             SELECT *, ROUND(EXTRACT(EPOCH FROM (lease_expires_at - NOW()))::numeric, 2) AS remaining_lease_seconds
             FROM updated_item;
             """
-            row = await conn.fetchrow(claim_query, reviewer_id, str(self.lease_duration))
+            try:
+                row = await conn.fetchrow(claim_query, reviewer_id, str(self.lease_duration))
+            except asyncpg.exceptions.UniqueViolationError:
+                # Concurrent claim from the same reviewer committed at the exact same instant
+                active = await self.get_active_claim_for_reviewer(reviewer_id, conn=conn)
+                if active:
+                    return active, True
+                return None, False
 
             if not row:
+                # Either queue is empty, or reviewer already had an active claim committed concurrently
+                active = await self.get_active_claim_for_reviewer(reviewer_id, conn=conn)
+                if active:
+                    return active, True
                 return None, False
 
             item = dict(row)
@@ -255,7 +279,7 @@ class QueueEngine:
     async def release_item(self, item_id: str, reviewer_id: str, reason: str = "voluntary_release") -> Dict[str, Any]:
         """
         Voluntarily releases a claimed item back to the queue (status returns to PENDING).
-        Guarantees that only the reviewer currently holding the lease can release it.
+        Guarantees that only the reviewer currently holding the active lease can release it.
         """
         if not self.pool:
             raise RuntimeError("Database pool not initialized.")
@@ -264,7 +288,7 @@ class QueueEngine:
             release_query = """
             WITH target_item AS (
                 SELECT id FROM inspection_items
-                WHERE id = $1 AND status = 'CLAIMED' AND claimed_by = $2
+                WHERE id = $1 AND status = 'CLAIMED' AND claimed_by = $2 AND lease_expires_at > NOW()
                 FOR UPDATE
             ),
             updated_item AS (
@@ -288,7 +312,16 @@ class QueueEngine:
             row = await conn.fetchrow(release_query, item_id, reviewer_id, reason)
 
             if not row:
-                raise ItemNotClaimedError(f"Item {item_id} is not actively claimed by reviewer {reviewer_id}.")
+                current = await conn.fetchrow("SELECT status, claimed_by, lease_expires_at FROM inspection_items WHERE id = $1;", item_id)
+                if not current:
+                    raise ItemNotClaimedError(f"Item {item_id} does not exist.")
+                if current["status"] != "CLAIMED":
+                    raise ItemNotClaimedError(f"Item {item_id} is not claimed (current status: {current['status']}).")
+                if current["claimed_by"] != reviewer_id:
+                    raise ItemNotClaimedError(f"Item {item_id} is claimed by {current['claimed_by']}, not {reviewer_id}.")
+                if current["lease_expires_at"] and current["lease_expires_at"] <= datetime.now(timezone.utc):
+                    raise ItemNotClaimedError(f"Cannot release item {item_id}: lease has expired.")
+                raise ItemNotClaimedError(f"Cannot release item {item_id}.")
 
             item = dict(row)
             if isinstance(item.get("payload"), str):

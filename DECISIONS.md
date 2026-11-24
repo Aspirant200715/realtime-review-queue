@@ -143,15 +143,24 @@ The brief presents an inherent tension: **strict global priority ordering vs. lo
     FROM updated_item;
     ```
   * **Where the Atomicity Lives:** Row-level locking occurs within PostgreSQL's internal lock manager via `FOR UPDATE`. `SKIP LOCKED` instructs the planner to bypass any tuple currently locked by another concurrent transaction and lock the next qualifying row in index order. Because the row lock and update happen in one query plan execution, there is zero gap between reading the top item and taking it.
-* **Reviewer Invariants & Idempotency:**
-  * **Single Active Claim Per Reviewer:** A human inspector on a visual line cannot work on multiple parts simultaneously. Before claiming, the engine checks if the reviewer currently holds an active, unexpired claim (`lease_expires_at > NOW()`). If so, it returns that existing active item. This prevents a reviewer from hoarding parts or orphaning unfinished work.
+* **Reviewer Invariants, Idempotency & TOCTOU Hardening:**
+  * **Single Active Claim Enforcement (Database-Level Guarantee):**
+    A human inspector on a visual line cannot work on multiple parts simultaneously. To prevent TOCTOU race conditions where two simultaneous claim requests from the *same reviewer* might both pass a pre-check and grab two items, we instituted **two complementary layers of defense**:
+    1. **CTE Guard:** `claim_query` checks `WHERE NOT EXISTS (SELECT 1 FROM reviewer_active WHERE claimed_by = $1 AND status = 'CLAIMED' AND lease_expires_at > NOW())`.
+    2. **Partial Unique Index:**
+       ```sql
+       CREATE UNIQUE INDEX idx_one_active_claim_per_reviewer
+       ON inspection_items (claimed_by)
+       WHERE status = 'CLAIMED';
+       ```
+    If two concurrent requests from the same reviewer reach the database simultaneously, PostgreSQL’s unique constraint physically prohibits assigning two active items. The engine traps `UniqueViolationError` and idempotently returns the winning active claim.
   * **Empty Queue Handling:** If the backlog is empty or all pending items are locked by concurrent claims, the query safely returns `None`.
 * **Decision & Stale Lease Protection:**
   * When a reviewer submits a `'PASS'` or `'FAIL'`, the query strictly validates:
     `WHERE id = $1 AND status = 'CLAIMED' AND claimed_by = $2 AND lease_expires_at > NOW()`
   * If a reviewer’s lease expired while they were idle and another reviewer subsequently claimed or processed the item, the update affects 0 rows, and the API rejects the submission with HTTP 409 Conflict (`ItemNotClaimedError`). This prevents stale decisions from corrupting recovered items.
 * **Voluntary Release Semantics:**
-  * When a reviewer clicks "Release", the item status is reset to `'PENDING'`, clearing `claimed_by` and `lease_expires_at`. The item immediately becomes available to the next available reviewer in priority order, logging event `'RELEASED'` in `audit_events`.
+  * When a reviewer clicks "Release", the item status is reset to `'PENDING'`, clearing `claimed_by` and `lease_expires_at`, while strictly verifying `lease_expires_at > NOW()`. The item immediately becomes available to the next available reviewer in priority order, logging event `'RELEASED'` in `audit_events`.
 
 ---
 
