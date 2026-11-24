@@ -116,7 +116,46 @@ The brief presents an inherent tension: **strict global priority ordering vs. lo
 
 ---
 
-## 7. Verification & Empirical Results
+## 7. Queue Engine & Atomic Claim Handout (Phase 3)
+
+* **Handout Atomicity Architecture:**
+  * To solve **D1 (Exactly-once handout under burst)**, the claim operation combines the candidate row seek, exclusive row lock acquisition, state transition to `'CLAIMED'`, assignment of reviewer identity, lease duration initialization, and audit event insertion into a **single atomic statement via multi-statement Common Table Expressions (CTEs)**:
+    ```sql
+    WITH next_item AS (
+        SELECT id FROM inspection_items
+        WHERE status = 'PENDING'
+        ORDER BY priority DESC, arrival_time ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+    ),
+    updated_item AS (
+        UPDATE inspection_items
+        SET status = 'CLAIMED',
+            claimed_by = $1,
+            claimed_at = NOW(),
+            lease_expires_at = NOW() + ($2 || ' seconds')::INTERVAL
+        FROM next_item
+        WHERE inspection_items.id = next_item.id
+        RETURNING inspection_items.*
+    )
+    INSERT INTO audit_events (item_id, event_type, reviewer_id, metadata)
+    SELECT id, 'CLAIMED', $1, json_build_object('priority', priority, 'lease_duration', $2::text)
+    FROM updated_item;
+    ```
+  * **Where the Atomicity Lives:** Row-level locking occurs within PostgreSQL's internal lock manager via `FOR UPDATE`. `SKIP LOCKED` instructs the planner to bypass any tuple currently locked by another concurrent transaction and lock the next qualifying row in index order. Because the row lock and update happen in one query plan execution, there is zero gap between reading the top item and taking it.
+* **Reviewer Invariants & Idempotency:**
+  * **Single Active Claim Per Reviewer:** A human inspector on a visual line cannot work on multiple parts simultaneously. Before claiming, the engine checks if the reviewer currently holds an active, unexpired claim (`lease_expires_at > NOW()`). If so, it returns that existing active item. This prevents a reviewer from hoarding parts or orphaning unfinished work.
+  * **Empty Queue Handling:** If the backlog is empty or all pending items are locked by concurrent claims, the query safely returns `None`.
+* **Decision & Stale Lease Protection:**
+  * When a reviewer submits a `'PASS'` or `'FAIL'`, the query strictly validates:
+    `WHERE id = $1 AND status = 'CLAIMED' AND claimed_by = $2 AND lease_expires_at > NOW()`
+  * If a reviewer’s lease expired while they were idle and another reviewer subsequently claimed or processed the item, the update affects 0 rows, and the API rejects the submission with HTTP 409 Conflict (`ItemNotClaimedError`). This prevents stale decisions from corrupting recovered items.
+* **Voluntary Release Semantics:**
+  * When a reviewer clicks "Release", the item status is reset to `'PENDING'`, clearing `claimed_by` and `lease_expires_at`. The item immediately becomes available to the next available reviewer in priority order, logging event `'RELEASED'` in `audit_events`.
+
+---
+
+## 8. Verification & Empirical Results
 
 * **EXPLAIN ANALYZE Verification:**
   * Executed on a dataset of 2,500 mixed items (1,500 PENDING, 500 PASSED, 300 FAILED, 200 CLAIMED).

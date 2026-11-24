@@ -1,3 +1,4 @@
+import asyncio
 import os
 import asyncpg
 from pathlib import Path
@@ -9,15 +10,20 @@ _pool: Optional[asyncpg.Pool] = None
 
 async def get_db_pool() -> asyncpg.Pool:
     global _pool
-    if _pool is None:
-        raise RuntimeError("Database connection pool is not initialized. Call init_db_pool() first.")
+    current_loop = asyncio.get_running_loop()
+    if _pool is None or _pool._loop.is_closed() or _pool._loop != current_loop:
+        return await init_db_pool()
     return _pool
 
 
 async def init_db_pool() -> asyncpg.Pool:
     global _pool
+    current_loop = asyncio.get_running_loop()
     if _pool is not None:
-        return _pool
+        if not _pool._loop.is_closed() and _pool._loop == current_loop:
+            return _pool
+        # If pool was attached to a dead or previous event loop, reset it
+        _pool = None
 
     if settings.database_url:
         _pool = await asyncpg.create_pool(
@@ -59,5 +65,10 @@ async def init_db_pool() -> asyncpg.Pool:
 async def close_db_pool() -> None:
     global _pool
     if _pool is not None:
-        await _pool.close()
-        _pool = None
+        try:
+            if not _pool._loop.is_closed():
+                await _pool.close()
+        except Exception:
+            pass
+        finally:
+            _pool = None

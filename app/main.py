@@ -3,11 +3,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+
 from app.db import init_db_pool, close_db_pool, get_db_pool
 from app.generator import generator_service
+from app.queue import queue_engine, ItemNotClaimedError, QueueError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,10 +18,35 @@ logging.basicConfig(
 logger = logging.getLogger("review_queue")
 
 
+# -------------------------------------------------------------
+# Request Schemas
+# -------------------------------------------------------------
+
 class BurstRequest(BaseModel):
     size: int = Field(default=250, ge=1, le=1000, description="Number of items to generate in burst")
     duration: float = Field(default=8.0, ge=0.5, le=30.0, description="Duration in seconds (default 8.0s, <10s)")
 
+
+class ClaimRequest(BaseModel):
+    reviewer_id: str = Field(..., min_length=1, max_length=64, description="ID of the claiming reviewer")
+
+
+class JudgeRequest(BaseModel):
+    item_id: str = Field(..., min_length=1, max_length=64)
+    reviewer_id: str = Field(..., min_length=1, max_length=64)
+    decision: str = Field(..., pattern="^(PASS|FAIL)$", description="Must be 'PASS' or 'FAIL'")
+    notes: Optional[str] = Field(None, max_length=500)
+
+
+class ReleaseRequest(BaseModel):
+    item_id: str = Field(..., min_length=1, max_length=64)
+    reviewer_id: str = Field(..., min_length=1, max_length=64)
+    reason: Optional[str] = Field("voluntary_release", max_length=200)
+
+
+# -------------------------------------------------------------
+# Lifespan
+# -------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -28,6 +55,7 @@ async def lifespan(app: FastAPI):
         pool = await init_db_pool()
         logger.info("Database pool initialized and schema verified.")
         generator_service.set_pool(pool)
+        queue_engine.set_pool(pool)
     except Exception as e:
         logger.error(f"Failed to connect to database on startup: {e}")
         raise e
@@ -40,6 +68,10 @@ async def lifespan(app: FastAPI):
     await close_db_pool()
     logger.info("Database pool closed.")
 
+
+# -------------------------------------------------------------
+# FastAPI App
+# -------------------------------------------------------------
 
 app = FastAPI(
     title="Real-Time Review Queue",
@@ -72,7 +104,107 @@ async def health_check():
 
 
 # -------------------------------------------------------------
-# Load Generator Control Endpoints
+# Queue Engine Endpoints (Phase 3)
+# -------------------------------------------------------------
+
+@app.post("/api/queue/claim")
+async def claim_item(req: ClaimRequest):
+    """
+    Atomically claims the highest priority pending item for a reviewer.
+    If the reviewer already holds an active claim, returns that claim (idempotent).
+    """
+    try:
+        item, already_claimed = await queue_engine.claim_next_item(req.reviewer_id)
+        if item is None:
+            return {
+                "item": None,
+                "already_claimed": False,
+                "message": "Queue is currently empty. No pending items available."
+            }
+        return {
+            "item": item,
+            "already_claimed": already_claimed,
+            "message": "Existing active claim returned" if already_claimed else "Item claimed successfully"
+        }
+    except Exception as e:
+        logger.error(f"Error claiming item for {req.reviewer_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/queue/judge")
+async def judge_item(req: JudgeRequest):
+    """
+    Records a PASS or FAIL judgement for an actively claimed item.
+    Guarantees only the currently active lease-holder can judge the item.
+    """
+    try:
+        item = await queue_engine.record_decision(
+            item_id=req.item_id,
+            reviewer_id=req.reviewer_id,
+            decision=req.decision,
+            notes=req.notes
+        )
+        return {"message": f"Item successfully judged {req.decision}", "item": item}
+    except ItemNotClaimedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error recording decision: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/queue/release")
+async def release_item(req: ReleaseRequest):
+    """
+    Voluntarily releases a claimed item back to the PENDING queue.
+    """
+    try:
+        item = await queue_engine.release_item(
+            item_id=req.item_id,
+            reviewer_id=req.reviewer_id,
+            reason=req.reason or "voluntary_release"
+        )
+        return {"message": "Item returned to PENDING queue", "item": item}
+    except ItemNotClaimedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error releasing item: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/queue/stats")
+async def get_queue_stats():
+    """Returns current backlog counts, reviewer allocations, and next item preview."""
+    try:
+        return await queue_engine.get_queue_stats()
+    except Exception as e:
+        logger.error(f"Error fetching queue stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/queue/active/{reviewer_id}")
+async def get_reviewer_active_item(reviewer_id: str):
+    """Returns any actively claimed item held by the reviewer."""
+    try:
+        active = await queue_engine.get_active_claim_for_reviewer(reviewer_id)
+        return {"active_item": active}
+    except Exception as e:
+        logger.error(f"Error fetching active item for {reviewer_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/queue/preview")
+async def preview_next_item():
+    """Peeks at the highest-priority pending item without claiming it."""
+    try:
+        preview = await queue_engine.peek_next_item()
+        return {"preview": preview}
+    except Exception as e:
+        logger.error(f"Error peeking next item: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -------------------------------------------------------------
+# Load Generator Control Endpoints (Phase 2)
 # -------------------------------------------------------------
 
 @app.post("/api/generator/start")
