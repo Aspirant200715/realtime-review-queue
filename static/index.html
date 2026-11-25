@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Real-Time Inspection Review Queue</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <!-- Header / System Bar -->
+  <header class="app-header">
+    <div class="header-left">
+      <div class="logo-mark">
+        <span class="pulse-dot"></span>
+        <span class="brand-title">LINE-01 // REALTIME REVIEW QUEUE</span>
+      </div>
+      <div class="connection-status" id="connection-status">
+        <span class="status-indicator connected"></span>
+        <span class="status-label">WEBSOCKET CONNECTED</span>
+        <span class="seq-badge" id="seq-counter">SEQ #0</span>
+      </div>
+    </div>
+
+    <div class="header-center">
+      <div class="view-toggle">
+        <button class="view-btn active" id="btn-view-single" data-view="single">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/></svg>
+          Single Workstation
+        </button>
+        <button class="view-btn" id="btn-view-grid" data-view="grid">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+          6-Reviewer Grid
+        </button>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <div class="reviewer-selector-wrapper" id="reviewer-selector-container">
+        <label for="reviewer-select">WORKSTATION:</label>
+        <select id="reviewer-select" class="terminal-select">
+          <option value="reviewer_1">Reviewer 1 (Alpha)</option>
+          <option value="reviewer_2">Reviewer 2 (Bravo)</option>
+          <option value="reviewer_3">Reviewer 3 (Charlie)</option>
+          <option value="reviewer_4">Reviewer 4 (Delta)</option>
+          <option value="reviewer_5">Reviewer 5 (Echo)</option>
+          <option value="reviewer_6">Reviewer 6 (Foxtrot)</option>
+        </select>
+      </div>
+    </div>
+  </header>
+
+  <!-- Global Telemetry & Generator Control Bar -->
+  <section class="telemetry-bar">
+    <div class="stat-card">
+      <div class="stat-label">PENDING BACKLOG</div>
+      <div class="stat-val-group">
+        <span class="stat-value" id="stat-pending">0</span>
+        <span class="stat-unit">items</span>
+      </div>
+      <div class="stat-sub" id="stat-sub-breakdown">
+        <span class="badge-crit" id="badge-crit">0 Crit</span>
+        <span class="badge-high" id="badge-high">0 High</span>
+        <span class="badge-rout" id="badge-rout">0 Rout</span>
+      </div>
+    </div>
+
+    <div class="stat-card">
+      <div class="stat-label">ACTIVELY CLAIMED</div>
+      <div class="stat-val-group">
+        <span class="stat-value" id="stat-claimed">0</span>
+        <span class="stat-unit">/ 6 active</span>
+      </div>
+      <div class="stat-sub" id="stat-active-names">No active reviewers</div>
+    </div>
+
+    <div class="stat-card">
+      <div class="stat-label">INSPECTIONS COMPLETED</div>
+      <div class="stat-val-group">
+        <span class="stat-value pass-text" id="stat-passed">0</span>
+        <span class="stat-divider">/</span>
+        <span class="stat-value fail-text" id="stat-failed">0</span>
+      </div>
+      <div class="stat-sub">PASSED / FAILED</div>
+    </div>
+
+    <div class="stat-card">
+      <div class="stat-label">ARRIVAL TELEMETRY</div>
+      <div class="stat-val-group">
+        <span class="stat-value" id="stat-rate">0.0</span>
+        <span class="stat-unit">items/sec</span>
+      </div>
+      <div class="stat-sub" id="stat-sweeper-info">Sweeper: Active (<9s bound)</div>
+    </div>
+
+    <!-- Generator Action Triggers -->
+    <div class="controls-card">
+      <div class="control-label">LOAD GENERATOR CONTROLS</div>
+      <div class="control-actions">
+        <button class="btn-ctrl btn-burst" id="btn-burst" title="Dumps 250 items in 8 seconds (<10s)">
+          <span class="btn-icon">💥</span>
+          <span class="btn-text">Burst 250 Items</span>
+        </button>
+        <button class="btn-ctrl btn-steady" id="btn-steady" title="Toggle 5 items/sec steady stream">
+          <span class="btn-icon">⚡</span>
+          <span class="btn-text" id="btn-steady-text">Start Flow (5/s)</span>
+        </button>
+        <button class="btn-ctrl btn-seed" id="btn-seed" title="Quick seed of 10 items">
+          <span class="btn-icon">+</span>
+          <span class="btn-text">Seed 10</span>
+        </button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Main View Container -->
+  <main class="main-container">
+    
+    <!-- ============================================================ -->
+    <!-- VIEW A: Single Reviewer Dedicated Workstation                -->
+    <!-- ============================================================ -->
+    <div class="view-panel active" id="view-single">
+      <div class="workstation-grid">
+        
+        <!-- Left: Active Item Review Desk -->
+        <div class="review-desk card">
+          <div class="card-header">
+            <div class="desk-title">
+              <span class="terminal-tag">DESK //</span>
+              <span id="active-reviewer-heading">Reviewer 1 (Alpha)</span>
+            </div>
+            <div class="lease-status-box" id="lease-box" style="display: none;">
+              <span class="lease-label">LEASE REMAINING:</span>
+              <span class="lease-seconds" id="lease-seconds">8.0s</span>
+              <div class="lease-bar-container">
+                <div class="lease-bar-fill" id="lease-bar-fill" style="width: 100%;"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Empty State (When no item claimed) -->
+          <div class="empty-desk-state" id="desk-empty-state">
+            <div class="empty-icon">📦</div>
+            <h3 class="empty-title">Ready for Inspection</h3>
+            <p class="empty-desc">Click "Claim Next Item" or press <kbd>Space</kbd> to atomically acquire the highest-priority pending item.</p>
+            <button class="btn-claim-primary" id="btn-claim-action">
+              <span class="claim-icon">⚡</span> CLAIM NEXT ITEM [Space]
+            </button>
+          </div>
+
+          <!-- Claimed Item Inspection Workspace -->
+          <div class="active-item-workspace" id="desk-active-state" style="display: none;">
+            <!-- Defect Header & Badges -->
+            <div class="item-meta-banner">
+              <div class="meta-part">
+                <span class="meta-label">PART NUMBER</span>
+                <span class="meta-val part-id" id="item-part-id">PRT-0000-A</span>
+              </div>
+              <div class="meta-priority">
+                <span class="meta-label">PRIORITY SCORE</span>
+                <span class="priority-badge" id="item-priority-badge">10 / CRITICAL</span>
+              </div>
+              <div class="meta-component">
+                <span class="meta-label">COMPONENT</span>
+                <span class="meta-val" id="item-component">Turbine Blade</span>
+              </div>
+            </div>
+
+            <!-- Defect Detail Card -->
+            <div class="defect-details-grid">
+              <div class="defect-info-box">
+                <div class="box-label">DETECTED DEFECT TYPE</div>
+                <div class="box-value defect-type-text" id="item-defect-type">Structural Micro-fracture</div>
+                <div class="confidence-container">
+                  <div class="conf-header">
+                    <span>AI Model Confidence:</span>
+                    <span id="item-confidence-text">98.4%</span>
+                  </div>
+                  <div class="conf-bar-bg">
+                    <div class="conf-bar-fill" id="item-confidence-fill" style="width: 98%;"></div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="defect-metrics-box">
+                <div class="metric-row">
+                  <span class="m-label">Inspection Camera:</span>
+                  <span class="m-val" id="item-camera">CAM-ALPHA-01</span>
+                </div>
+                <div class="metric-row">
+                  <span class="m-label">Bounding Dims:</span>
+                  <span class="m-val" id="item-dimensions">12.4 x 3.1 x 0.8 mm</span>
+                </div>
+                <div class="metric-row">
+                  <span class="m-label">Ingested At:</span>
+                  <span class="m-val" id="item-arrival-time">10:45:02 UTC</span>
+                </div>
+                <div class="metric-row">
+                  <span class="m-label">Item UUID:</span>
+                  <span class="m-val uuid-text" id="item-uuid">e4b1...</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Walkaway / Heartbeat Simulation Banner -->
+            <div class="walkaway-banner">
+              <div class="walkaway-info">
+                <span class="walkaway-tag">WALKAWAY RECOVERY DEMO</span>
+                <span class="walkaway-text">Pause heartbeats to let the 8s lease expire. The sweeper will recover this item back to queue in <9s.</span>
+              </div>
+              <button class="btn-walkaway" id="btn-toggle-walkaway">
+                ⏸ Simulate Walkaway (Pause Heartbeat)
+              </button>
+            </div>
+
+            <!-- Notes Input -->
+            <div class="inspection-notes-box">
+              <label for="inspection-notes">REVIEWER NOTES (Optional):</label>
+              <input type="text" id="inspection-notes" placeholder="e.g. Surface crack confirmed under optical magnification..." maxlength="200">
+            </div>
+
+            <!-- Action Buttons -->
+            <div class="decision-action-bar">
+              <button class="btn-action btn-pass" id="btn-action-pass" title="Keyboard shortcut: P">
+                <span class="action-key">[P]</span> PASS COMPONENT
+              </button>
+              <button class="btn-action btn-fail" id="btn-action-fail" title="Keyboard shortcut: F">
+                <span class="action-key">[F]</span> FAIL COMPONENT
+              </button>
+              <button class="btn-action btn-release" id="btn-action-release" title="Keyboard shortcut: R">
+                <span class="action-key">[R]</span> RELEASE TO QUEUE
+              </button>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- Right: Telemetry, Next Up Preview & Live Event Stream -->
+        <div class="sidebar-desk">
+          
+          <!-- Next Up Preview Card -->
+          <div class="card next-preview-card">
+            <div class="card-header">
+              <span class="terminal-tag">QUEUE HEAD //</span>
+              <span>Next Up in Line</span>
+            </div>
+            <div class="next-preview-content" id="next-preview-box">
+              <div class="preview-empty">No pending items in queue.</div>
+            </div>
+          </div>
+
+          <!-- Active Reviewer Roster -->
+          <div class="card roster-card">
+            <div class="card-header">
+              <span class="terminal-tag">ROSTER //</span>
+              <span>Reviewer Stations (6)</span>
+            </div>
+            <div class="roster-list" id="roster-list">
+              <!-- Dynamically populated -->
+            </div>
+          </div>
+
+          <!-- Real-Time Activity Log -->
+          <div class="card activity-card">
+            <div class="card-header">
+              <span class="terminal-tag">AUDIT LOG //</span>
+              <span>Live Pushed Events</span>
+            </div>
+            <div class="activity-log-stream" id="activity-log">
+              <div class="log-entry log-system">System initialized. Awaiting events...</div>
+            </div>
+          </div>
+
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- VIEW B: 6-Reviewer Grid Overview ("God Mode" for Demos)      -->
+    <!-- ============================================================ -->
+    <div class="view-panel" id="view-grid">
+      <div class="grid-instruction-bar">
+        <span>6 CONCURRENT REVIEWER WORKSTATIONS RUNNING SIMULTANEOUSLY AGAINST THE SHARED BACKLOG</span>
+        <button class="btn-ctrl btn-claim-all" id="btn-claim-all">⚡ Claim on All 6 Reviewers Concurrently</button>
+      </div>
+      <div class="reviewers-grid-6" id="reviewers-grid-container">
+        <!-- 6 Reviewer Station Cards (Reviewer 1 through 6) generated by app.js -->
+      </div>
+    </div>
+
+  </main>
+
+  <footer class="app-footer">
+    <div class="footer-left">Real-Time Visual Inspection Queue &bull; PostgreSQL 16 `SKIP LOCKED` &bull; Native FastAPI WebSockets</div>
+    <div class="footer-right">Invariants: Zero Double Claims &bull; Bounded Recovery &lt;9.0s &bull; Zero Polling</div>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

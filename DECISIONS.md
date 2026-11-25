@@ -223,13 +223,33 @@ The brief presents an inherent tension: **strict global priority ordering vs. lo
 * **Monitoring Channel (`/ws/queue`):**
   * Dedicated lightweight broadcast endpoint for line supervisors or display screens needing real-time queue depth, defect priority breakdown, and telemetry without reviewer-specific state.
 
-* **Connection Fault-Tolerance & Serialization:**
+* **Connection Fault-Tolerance, Sequencing & Hardening:**
+  * **Monotonic Sequence Ordering (`seq` & `timestamp`):** Every `QUEUE_UPDATE` payload includes an auto-incrementing integer sequence counter (`seq`) and a UTC ISO timestamp. This enables frontends to discard stale, out-of-order broadcasts caused by network jitter or concurrent database event resolution.
+  * **Per-Socket Send Timeout & Automatic Pruning:** Socket transmissions are guarded with a 1.0-second timeout (`asyncio.wait_for(ws.send_text(...), timeout=1.0)`). Stalled or broken sockets (e.g. frozen browser tabs or severed TCP connections) are caught and automatically pruned from `active_connections`, preventing memory leaks and blocking delays.
+  * **Active Push on Sweeper Recovery:** When the background sweeper reclaims expired items, it immediately pushes a targeted `LEASE_LOST` message to the affected reviewer's active tabs via `ws_manager.send_personal_message()`, ensuring the browser UI updates instantaneously without waiting for the next periodic heartbeat.
+  * **Multi-Tab Reviewer Synchronization:** Personal action acknowledgments (`CLAIM_RESULT`, `DECISION_ACK`, `RELEASE_ACK`) are dispatched via `send_personal_message()` across all open tabs of a reviewer, keeping multiple screens in continuous lockstep.
   * Uses `serialize_json` with custom ISO 8601 datetime and Decimal handlers, avoiding runtime serialization panics.
-  * Disconnected or closed client sockets are cleanly pruned from `ConnectionManager` upon exception or disconnect event, preventing socket leakages.
 
 ---
 
-## 10. What We Would Do Next (Scaling to 10x Load)
+## 10. Browser Reviewer Dashboard & Multi-Screen Interface (Phase 6)
+
+* **Dual-View Operational Ergonomics:**
+  * **Dedicated Single-Workstation Mode (`/?reviewer=reviewer_X`):** Clean, high-focus interface for human inspectors at industrial quality-control stations. Displays active part number, component classification, bounding dimensions, camera ID, AI defect confidence meter, and high-visibility priority badges (Critical 9–10 in Emergency Red, High 6–8 in Warning Amber, Routine 1–5 in Steel Blue).
+  * **6-Reviewer Concurrent Grid Mode ("God Mode"):** A real-time overview displaying all 6 reviewer stations side-by-side on a responsive 3x2 grid. Reviewers' active claims, lease status, and judgements update live, enabling line supervisors (and video demonstrations) to observe contention resolution and parallel throughput across the entire line simultaneously.
+
+* **Sub-Second Lease Countdown & Two-Way Heartbeat Lifecycle:**
+  * While an item is actively held, a dynamic visual countdown bar ticks at 100ms intervals from 8.0s downward, shifting colors (green $\to$ amber $\to$ emergency red) as urgency increases.
+  * An automated background timer sends a lightweight `HEARTBEAT` frame over the WebSocket every 2.5 seconds, renewing the database lease (`lease_expires_at = NOW() + 8s`) and keeping the visual bar topped up.
+  * **Walkaway Simulation Toggle:** A dedicated "Simulate Walkaway" button pauses automated heartbeats, allowing inspectors and evaluators to watch the lease expire to 0.0s and verify live sweeper reclamation returning the item to the backlog within the strictly bounded $<9.0s$ window.
+
+* **Zero-Build Vanilla Architecture:**
+  * Implemented in clean, modern HTML5, CSS3, and native ES6 JavaScript without external npm dependencies or complex build steps.
+  * Serves directly from FastAPI via `StaticFiles` and `FileResponse`.
+
+---
+
+## 11. What We Would Do Next (Scaling to 10x Load)
 
 If the system were subjected to **10x higher volume** (50x arrivals = ~250 items/sec steady, ~2,500 item bursts, 60 reviewers):
 1. **Queue Partitioning / Priority Bucketing:** At 60 concurrent reviewers, index contention on the single `(priority DESC, arrival_time ASC)` head can introduce row-lock wait spikes in PostgreSQL. We would partition the queue into separate priority tiers (Critical, High, Routine) or shard across worker pools.

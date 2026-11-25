@@ -1,11 +1,13 @@
 import json
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.db import init_db_pool, close_db_pool, get_db_pool
@@ -73,7 +75,9 @@ async def lifespan(app: FastAPI):
                     "type": "QUEUE_UPDATE",
                     "trigger": "ITEM_ARRIVAL",
                     "arrival_count": len(items),
-                    "stats": stats
+                    "stats": stats,
+                    "seq": ws_manager.get_next_seq(),
+                    "timestamp": datetime.now(timezone.utc).isoformat()
                 })
             except Exception as e:
                 logger.error(f"Error broadcasting on item arrival: {e}")
@@ -81,14 +85,28 @@ async def lifespan(app: FastAPI):
         generator_service.register_listener(on_items_generated)
 
         # Wire real-time push broadcasts on claim, decision, release, and lease recovery
-        async def on_queue_event(event_type, data):
+        async def on_queue_event(event_type: str, data: dict):
             try:
+                # If sweeper reclaimed items, actively push LEASE_LOST to the affected reviewers
+                if event_type == "LEASE_RECOVERED":
+                    recovered_items = data.get("recovered_items", [])
+                    for item in recovered_items:
+                        claimed_by = item.get("claimed_by")
+                        if claimed_by:
+                            await ws_manager.send_personal_message({
+                                "type": "LEASE_LOST",
+                                "item_id": item.get("id"),
+                                "message": "Lease expired and was reclaimed by the background sweeper."
+                            }, claimed_by)
+
                 stats = await queue_engine.get_queue_stats()
                 await ws_manager.broadcast({
                     "type": "QUEUE_UPDATE",
                     "trigger": event_type,
                     "event_data": data,
-                    "stats": stats
+                    "stats": stats,
+                    "seq": ws_manager.get_next_seq(),
+                    "timestamp": datetime.now(timezone.utc).isoformat()
                 })
             except Exception as e:
                 logger.error(f"Error broadcasting on queue event ({event_type}): {e}")
@@ -358,11 +376,12 @@ async def reviewer_websocket_endpoint(websocket: WebSocket, reviewer_id: str):
 
                 elif msg_type == "CLAIM":
                     item, already = await queue_engine.claim_next_item(reviewer_id)
-                    await websocket.send_text(serialize_json({
+                    # Sync claim result to all open tabs of this reviewer
+                    await ws_manager.send_personal_message({
                         "type": "CLAIM_RESULT",
                         "item": item,
                         "already_claimed": already
-                    }))
+                    }, reviewer_id)
 
                 elif msg_type == "DECIDE":
                     item_id = msg.get("item_id")
@@ -370,11 +389,12 @@ async def reviewer_websocket_endpoint(websocket: WebSocket, reviewer_id: str):
                     notes = msg.get("notes")
                     try:
                         judged = await queue_engine.record_decision(item_id, reviewer_id, decision, notes)
-                        await websocket.send_text(serialize_json({
+                        # Sync decision ACK to all open tabs of this reviewer
+                        await ws_manager.send_personal_message({
                             "type": "DECISION_ACK",
                             "item": judged,
                             "decision": decision
-                        }))
+                        }, reviewer_id)
                     except ItemNotClaimedError as e:
                         await websocket.send_text(serialize_json({
                             "type": "ERROR",
@@ -387,10 +407,11 @@ async def reviewer_websocket_endpoint(websocket: WebSocket, reviewer_id: str):
                     reason = msg.get("reason", "voluntary_release")
                     try:
                         released = await queue_engine.release_item(item_id, reviewer_id, reason)
-                        await websocket.send_text(serialize_json({
+                        # Sync release ACK to all open tabs of this reviewer
+                        await ws_manager.send_personal_message({
                             "type": "RELEASE_ACK",
                             "item": released
-                        }))
+                        }, reviewer_id)
                     except ItemNotClaimedError as e:
                         await websocket.send_text(serialize_json({
                             "type": "ERROR",
@@ -433,7 +454,14 @@ async def queue_monitor_websocket(websocket: WebSocket):
         await ws_manager.disconnect(websocket, "monitor")
 
 
-# Mount static directory if it exists
+# Mount static directory and root index if it exists
 static_dir = Path(__file__).parent.parent / "static"
 if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+    @app.get("/")
+    async def get_index():
+        index_file = static_dir / "index.html"
+        if index_file.exists():
+            return FileResponse(index_file)
+        return {"message": "Review queue API operational. Frontend index.html not yet built."}

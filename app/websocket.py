@@ -31,6 +31,12 @@ class ConnectionManager:
         # Maps client_id (reviewer_id or 'monitor') to a set of active WebSockets
         self.active_connections: Dict[str, Set[WebSocket]] = {}
         self._lock = asyncio.Lock()
+        self._seq_counter: int = 0
+
+    def get_next_seq(self) -> int:
+        """Returns a monotonically increasing sequence ID for broadcast ordering."""
+        self._seq_counter += 1
+        return self._seq_counter
 
     async def connect(self, websocket: WebSocket, client_id: str):
         await websocket.accept()
@@ -48,6 +54,18 @@ class ConnectionManager:
                     del self.active_connections[client_id]
         logger.info(f"WebSocket client disconnected: {client_id} (Total clients: {self.total_connections})")
 
+    async def _prune_socket(self, ws: WebSocket):
+        """Removes a dead or unresponsive socket across all registered client mappings."""
+        async with self._lock:
+            empty_keys = []
+            for client_id, s_set in self.active_connections.items():
+                if ws in s_set:
+                    s_set.discard(ws)
+                    if not s_set:
+                        empty_keys.append(client_id)
+            for k in empty_keys:
+                del self.active_connections[k]
+
     @property
     def total_connections(self) -> int:
         return sum(len(conns) for conns in self.active_connections.values())
@@ -60,9 +78,10 @@ class ConnectionManager:
         text_data = serialize_json(message)
         for ws in sockets:
             try:
-                await ws.send_text(text_data)
+                await asyncio.wait_for(ws.send_text(text_data), timeout=1.0)
             except Exception as e:
-                logger.error(f"Error sending message to {client_id}: {e}")
+                logger.warning(f"Error sending message to {client_id}, pruning socket: {e}")
+                await self._prune_socket(ws)
 
     async def broadcast(self, message: Dict[str, Any]):
         """Broadcasts a JSON payload to all connected screens simultaneously."""
@@ -75,7 +94,7 @@ class ConnectionManager:
             return
 
         text_data = serialize_json(message)
-        # Fan out push to all connected screens in parallel
+        # Fan out push to all connected screens concurrently with timeout protection
         await asyncio.gather(
             *[self._safe_send(ws, text_data) for ws in all_sockets],
             return_exceptions=True
@@ -83,9 +102,10 @@ class ConnectionManager:
 
     async def _safe_send(self, ws: WebSocket, data: str):
         try:
-            await ws.send_text(data)
-        except Exception:
-            pass
+            await asyncio.wait_for(ws.send_text(data), timeout=1.0)
+        except Exception as e:
+            logger.debug(f"Failed to send to socket, pruning: {e}")
+            await self._prune_socket(ws)
 
 
 ws_manager = ConnectionManager()

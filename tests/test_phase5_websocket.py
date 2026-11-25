@@ -13,7 +13,7 @@ if os.path.exists("/home/aspirant/Projects/realtime-review-queue/.tools/run"):
     settings.postgres_port = 54329
 
 
-def receive_matching(ws, expected_type: str, max_messages: int = 10):
+def receive_matching(ws, expected_type: str, max_messages: int = 50):
     """
     Reads WebSocket messages until one with type `expected_type` is received.
     Discards or ignores interleaved broadcast messages (e.g. QUEUE_UPDATE).
@@ -212,3 +212,98 @@ def test_websocket_lease_expiry_notification():
             lost_msg = receive_matching(ws, "LEASE_LOST")
             assert lost_msg["type"] == "LEASE_LOST"
             assert lost_msg["item_id"] == claimed_id
+
+
+def test_websocket_malformed_and_unexpected_messages():
+    """Verify server gracefully handles malformed JSON, invalid types, and missing fields."""
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/reviewer/rev_malformed") as ws:
+            ws.receive_json()  # INITIAL_STATE
+
+            # 1. Send malformed raw JSON string
+            ws.send_text("INVALID_JSON{bad")
+            err_msg = receive_matching(ws, "ERROR")
+            assert err_msg["type"] == "ERROR"
+            assert "Invalid JSON" in err_msg["message"]
+
+            # 2. Send unknown message type - socket must remain alive
+            ws.send_json({"type": "UNKNOWN_COMMAND", "foo": "bar"})
+
+            # 3. Send invalid decision - should return error response without dropping socket
+            ws.send_json({"type": "DECIDE", "item_id": "nonexistent", "decision": "INVALID"})
+            err_msg2 = receive_matching(ws, "ERROR")
+            assert err_msg2["type"] == "ERROR"
+
+            # 4. Verify socket is still active and can claim/release normally
+            burst_res = client.post("/api/generator/burst", json={"size": 1, "duration": 0.5})
+            assert burst_res.status_code == 200
+
+            ws.send_json({"type": "CLAIM"})
+            claim_msg = receive_matching(ws, "CLAIM_RESULT")
+            assert claim_msg["type"] == "CLAIM_RESULT"
+            assert claim_msg["item"] is not None
+
+            # Clean up
+            ws.send_json({"type": "RELEASE", "item_id": claim_msg["item"]["id"]})
+            rel_msg = receive_matching(ws, "RELEASE_ACK")
+            assert rel_msg["type"] == "RELEASE_ACK"
+
+
+def test_websocket_multi_tab_sync_same_reviewer():
+    """Verify multiple tabs open for the same reviewer receive synchronized personal actions."""
+    with TestClient(app) as client:
+        burst_res = client.post("/api/generator/burst", json={"size": 2, "duration": 0.5})
+        assert burst_res.status_code == 200
+
+        with client.websocket_connect("/ws/reviewer/rev_tabs") as tab1:
+            with client.websocket_connect("/ws/reviewer/rev_tabs") as tab2:
+                tab1.receive_json()  # INITIAL_STATE
+                tab2.receive_json()  # INITIAL_STATE
+
+                # Tab 1 claims item
+                tab1.send_json({"type": "CLAIM"})
+
+                # BOTH Tab 1 and Tab 2 MUST receive CLAIM_RESULT
+                res1 = receive_matching(tab1, "CLAIM_RESULT")
+                res2 = receive_matching(tab2, "CLAIM_RESULT")
+
+                assert res1["type"] == "CLAIM_RESULT"
+                assert res2["type"] == "CLAIM_RESULT"
+                assert res1["item"]["id"] == res2["item"]["id"]
+                claimed_id = res1["item"]["id"]
+
+                # Tab 2 decides PASS on the claimed item
+                tab2.send_json({
+                    "type": "DECIDE",
+                    "item_id": claimed_id,
+                    "decision": "PASS"
+                })
+
+                # BOTH Tab 1 and Tab 2 MUST receive DECISION_ACK
+                ack1 = receive_matching(tab1, "DECISION_ACK")
+                ack2 = receive_matching(tab2, "DECISION_ACK")
+                assert ack1["type"] == "DECISION_ACK"
+                assert ack2["type"] == "DECISION_ACK"
+                assert ack1["item"]["id"] == claimed_id
+                assert ack2["item"]["id"] == claimed_id
+
+
+def test_websocket_monotonic_sequence_and_timestamp():
+    """Verify broadcasts carry monotonic sequence counter and ISO timestamps for ordering."""
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/queue") as ws:
+            ws.receive_json()  # INITIAL_STATE
+
+            # Emit batch 1
+            client.post("/api/generator/burst", json={"size": 2, "duration": 0.5})
+            msg1 = receive_matching(ws, "QUEUE_UPDATE")
+
+            # Emit batch 2
+            client.post("/api/generator/burst", json={"size": 2, "duration": 0.5})
+            msg2 = receive_matching(ws, "QUEUE_UPDATE")
+
+            assert "seq" in msg1 and "timestamp" in msg1
+            assert "seq" in msg2 and "timestamp" in msg2
+            assert isinstance(msg1["seq"], int)
+            assert isinstance(msg2["seq"], int)
+            assert msg2["seq"] > msg1["seq"]
