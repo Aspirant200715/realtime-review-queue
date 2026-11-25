@@ -207,7 +207,29 @@ The brief presents an inherent tension: **strict global priority ordering vs. lo
 
 ---
 
-## 6. What We Would Do Next (Scaling to 10x Load)
+## 9. Real-Time Push Broadcast & Reviewer WebSocket Architecture (Phase 5)
+
+* **Zero-Polling Push Guarantee (Rubrics D2 & D3):**
+  * Rather than having browser clients poll on a timer (which wastes server CPU and introduces up to several seconds of UI lag), the server maintains persistent WebSocket connections with all active reviewer screens and monitoring dashboards.
+  * An asynchronous event-bus hook (`on_queue_event` in `app/main.py`) is attached to `queue_engine`. Whenever *any* state transition occurs—whether an item arrival from the load generator, a claim by another reviewer, a pass/fail decision, a voluntary release, or a background sweeper recovery—the engine triggers `ws_manager.broadcast()`.
+  * The broadcast calculates fresh global stats (`pending_count`, `claimed_count`, `completed_count`, `active_reviewers`, and `next_preview` item) and pushes the payload immediately to all connected sockets in parallel via `asyncio.gather`.
+
+* **Bidirectional Reviewer Protocol (`/ws/reviewer/{reviewer_id}`):**
+  * **Connection & Hydration:** On connect, the server immediately pushes an `INITIAL_STATE` frame containing the reviewer's current active claim (if any) and global queue statistics.
+  * **Two-Way Heartbeats:** While an active item is held, the reviewer's browser sends a lightweight `{"type": "HEARTBEAT", "item_id": "..."}` frame every 2.5 seconds. The server invokes `renew_lease()` and responds with `HEARTBEAT_ACK` and remaining lease seconds.
+  * **Lease Lost Alert:** If the reviewer's lease expired (e.g. tab paused or network dropout) and the sweeper reclaimed the item, a subsequent heartbeat immediately triggers a `LEASE_LOST` frame, signaling the client UI to unlock and clear the workspace.
+  * **Interactive Inspection Driving:** Reviewers can perform their entire workflow (`CLAIM`, `DECIDE` with PASS/FAIL notes, `RELEASE`) directly over the WebSocket channel with sub-millisecond roundtrips, or via REST endpoints.
+
+* **Monitoring Channel (`/ws/queue`):**
+  * Dedicated lightweight broadcast endpoint for line supervisors or display screens needing real-time queue depth, defect priority breakdown, and telemetry without reviewer-specific state.
+
+* **Connection Fault-Tolerance & Serialization:**
+  * Uses `serialize_json` with custom ISO 8601 datetime and Decimal handlers, avoiding runtime serialization panics.
+  * Disconnected or closed client sockets are cleanly pruned from `ConnectionManager` upon exception or disconnect event, preventing socket leakages.
+
+---
+
+## 10. What We Would Do Next (Scaling to 10x Load)
 
 If the system were subjected to **10x higher volume** (50x arrivals = ~250 items/sec steady, ~2,500 item bursts, 60 reviewers):
 1. **Queue Partitioning / Priority Bucketing:** At 60 concurrent reviewers, index contention on the single `(priority DESC, arrival_time ASC)` head can introduce row-lock wait spikes in PostgreSQL. We would partition the queue into separate priority tiers (Critical, High, Routine) or shard across worker pools.

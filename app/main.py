@@ -1,15 +1,17 @@
+import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.db import init_db_pool, close_db_pool, get_db_pool
 from app.generator import generator_service
 from app.queue import queue_engine, lease_sweeper_service, ItemNotClaimedError, QueueError
+from app.websocket import ws_manager, serialize_json
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,6 +64,37 @@ async def lifespan(app: FastAPI):
         generator_service.set_pool(pool)
         queue_engine.set_pool(pool)
         lease_sweeper_service.start()
+
+        # Wire real-time push broadcasts on item arrivals
+        async def on_items_generated(items):
+            try:
+                stats = await queue_engine.get_queue_stats()
+                await ws_manager.broadcast({
+                    "type": "QUEUE_UPDATE",
+                    "trigger": "ITEM_ARRIVAL",
+                    "arrival_count": len(items),
+                    "stats": stats
+                })
+            except Exception as e:
+                logger.error(f"Error broadcasting on item arrival: {e}")
+
+        generator_service.register_listener(on_items_generated)
+
+        # Wire real-time push broadcasts on claim, decision, release, and lease recovery
+        async def on_queue_event(event_type, data):
+            try:
+                stats = await queue_engine.get_queue_stats()
+                await ws_manager.broadcast({
+                    "type": "QUEUE_UPDATE",
+                    "trigger": event_type,
+                    "event_data": data,
+                    "stats": stats
+                })
+            except Exception as e:
+                logger.error(f"Error broadcasting on queue event ({event_type}): {e}")
+
+        queue_engine.register_listener(on_queue_event)
+
     except Exception as e:
         logger.error(f"Failed to connect to database on startup: {e}")
         raise e
@@ -274,6 +307,130 @@ async def trigger_burst(req: BurstRequest = BurstRequest()):
 async def get_generator_status():
     """Returns real-time load generator metrics and recent arrival rate."""
     return generator_service.get_metrics()
+
+
+# -------------------------------------------------------------
+# WebSocket Endpoints (Phase 5)
+# -------------------------------------------------------------
+
+@app.websocket("/ws/reviewer/{reviewer_id}")
+async def reviewer_websocket_endpoint(websocket: WebSocket, reviewer_id: str):
+    """
+    Dedicated bidirectional WebSocket channel for a reviewer screen:
+    - Pushes live queue state and active item on connect.
+    - Broadcasts live backlog updates on all state transitions (zero polling).
+    - Accepts client heartbeats, claims, decisions, and releases.
+    """
+    await ws_manager.connect(websocket, reviewer_id)
+    try:
+        # Push initial queue state and active item
+        stats = await queue_engine.get_queue_stats()
+        active = await queue_engine.get_active_claim_for_reviewer(reviewer_id)
+        await websocket.send_text(serialize_json({
+            "type": "INITIAL_STATE",
+            "reviewer_id": reviewer_id,
+            "active_item": active,
+            "stats": stats
+        }))
+
+        while True:
+            raw_text = await websocket.receive_text()
+            try:
+                msg = json.loads(raw_text)
+                msg_type = msg.get("type", "").upper()
+
+                if msg_type == "HEARTBEAT":
+                    item_id = msg.get("item_id")
+                    if item_id:
+                        try:
+                            renewed = await queue_engine.renew_lease(item_id, reviewer_id)
+                            await websocket.send_text(serialize_json({
+                                "type": "HEARTBEAT_ACK",
+                                "item_id": item_id,
+                                "remaining_lease_seconds": renewed["remaining_lease_seconds"]
+                            }))
+                        except ItemNotClaimedError as e:
+                            await websocket.send_text(serialize_json({
+                                "type": "LEASE_LOST",
+                                "item_id": item_id,
+                                "message": str(e)
+                            }))
+
+                elif msg_type == "CLAIM":
+                    item, already = await queue_engine.claim_next_item(reviewer_id)
+                    await websocket.send_text(serialize_json({
+                        "type": "CLAIM_RESULT",
+                        "item": item,
+                        "already_claimed": already
+                    }))
+
+                elif msg_type == "DECIDE":
+                    item_id = msg.get("item_id")
+                    decision = msg.get("decision", "").upper()
+                    notes = msg.get("notes")
+                    try:
+                        judged = await queue_engine.record_decision(item_id, reviewer_id, decision, notes)
+                        await websocket.send_text(serialize_json({
+                            "type": "DECISION_ACK",
+                            "item": judged,
+                            "decision": decision
+                        }))
+                    except ItemNotClaimedError as e:
+                        await websocket.send_text(serialize_json({
+                            "type": "ERROR",
+                            "code": "DECISION_REJECTED",
+                            "message": str(e)
+                        }))
+
+                elif msg_type == "RELEASE":
+                    item_id = msg.get("item_id")
+                    reason = msg.get("reason", "voluntary_release")
+                    try:
+                        released = await queue_engine.release_item(item_id, reviewer_id, reason)
+                        await websocket.send_text(serialize_json({
+                            "type": "RELEASE_ACK",
+                            "item": released
+                        }))
+                    except ItemNotClaimedError as e:
+                        await websocket.send_text(serialize_json({
+                            "type": "ERROR",
+                            "code": "RELEASE_REJECTED",
+                            "message": str(e)
+                        }))
+
+            except json.JSONDecodeError:
+                await websocket.send_text(serialize_json({"type": "ERROR", "message": "Invalid JSON"}))
+            except Exception as e:
+                logger.error(f"Error handling WebSocket message from {reviewer_id}: {e}")
+                await websocket.send_text(serialize_json({"type": "ERROR", "message": str(e)}))
+
+    except WebSocketDisconnect:
+        await ws_manager.disconnect(websocket, reviewer_id)
+    except Exception as e:
+        logger.error(f"WebSocket exception for {reviewer_id}: {e}")
+        await ws_manager.disconnect(websocket, reviewer_id)
+
+
+@app.websocket("/ws/queue")
+async def queue_monitor_websocket(websocket: WebSocket):
+    """
+    Read-only broadcast WebSocket for multi-panel overview or dashboard monitoring.
+    Receives all live queue updates and telemetry.
+    """
+    await ws_manager.connect(websocket, "monitor")
+    try:
+        stats = await queue_engine.get_queue_stats()
+        await websocket.send_text(serialize_json({
+            "type": "INITIAL_STATE",
+            "stats": stats
+        }))
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        await ws_manager.disconnect(websocket, "monitor")
+    except Exception as e:
+        logger.error(f"Queue monitor WebSocket exception: {e}")
+        await ws_manager.disconnect(websocket, "monitor")
 
 
 # Mount static directory if it exists
