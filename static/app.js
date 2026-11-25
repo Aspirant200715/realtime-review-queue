@@ -642,6 +642,10 @@
     if (!body || !status) return;
 
     if (!item) {
+      if (state.gridReviewers[id]) {
+        state.gridReviewers[id].activeItem = null;
+        state.gridReviewers[id].leaseRemaining = 0;
+      }
       status.textContent = 'IDLE';
       status.style.color = 'var(--text-dim)';
       body.innerHTML = `
@@ -651,6 +655,22 @@
         </div>
       `;
     } else {
+      const initialLease = item.remaining_lease_seconds !== undefined
+        ? Math.max(0, parseFloat(item.remaining_lease_seconds))
+        : 8.0;
+
+      const isAlreadyRendered = state.gridReviewers[id]?.activeItem?.id === item.id && body.querySelector('.grid-desk-active');
+
+      if (state.gridReviewers[id]) {
+        state.gridReviewers[id].activeItem = item;
+        state.gridReviewers[id].leaseRemaining = initialLease;
+      }
+
+      if (isAlreadyRendered) {
+        updateGridLeaseBar(id, initialLease);
+        return;
+      }
+
       status.textContent = 'REVIEWING';
       status.style.color = 'var(--accent-cyan)';
       const p = item.priority;
@@ -668,8 +688,9 @@
           <div class="grid-defect-text">${payload.defect_type || 'Defect'}</div>
           <div class="grid-lease-row">
             <span>Lease:</span>
+            <span id="grid-lease-sec-${id}" style="font-family: var(--font-mono); font-weight: 700; color: var(--color-pass); font-size: 12px;">${initialLease.toFixed(1)}s</span>
             <div class="grid-lease-bar">
-              <div class="grid-lease-bar-fill" style="width: 100%;"></div>
+              <div class="grid-lease-bar-fill" id="grid-lease-fill-${id}" style="width: ${(initialLease / 8.0) * 100}%;"></div>
             </div>
           </div>
           <div class="grid-actions-row">
@@ -679,6 +700,43 @@
           </div>
         </div>
       `;
+      updateGridLeaseBar(id, initialLease);
+      startGridLeaseTicker();
+    }
+  }
+
+  let gridLeaseInterval = null;
+  function startGridLeaseTicker() {
+    if (gridLeaseInterval) return;
+    gridLeaseInterval = setInterval(() => {
+      if (state.currentView !== 'grid') return;
+      for (const id of Object.keys(state.gridReviewers)) {
+        const r = state.gridReviewers[id];
+        if (r && r.activeItem && r.leaseRemaining > 0) {
+          r.leaseRemaining = Math.max(0, r.leaseRemaining - 0.1);
+          updateGridLeaseBar(id, r.leaseRemaining);
+        }
+      }
+    }, 100);
+  }
+
+  function updateGridLeaseBar(id, remaining) {
+    const fill = document.getElementById(`grid-lease-fill-${id}`);
+    const sec = document.getElementById(`grid-lease-sec-${id}`);
+    if (!fill) return;
+    const pct = Math.max(0, Math.min(100, (remaining / CONFIG.LEASE_DURATION) * 100));
+    fill.style.width = `${pct}%`;
+    if (sec) sec.textContent = `${remaining.toFixed(1)}s`;
+
+    if (remaining > 4.5) {
+      fill.style.backgroundColor = 'var(--color-pass)';
+      if (sec) sec.style.color = 'var(--color-pass)';
+    } else if (remaining > 2.0) {
+      fill.style.backgroundColor = 'var(--color-high)';
+      if (sec) sec.style.color = 'var(--color-high)';
+    } else {
+      fill.style.backgroundColor = 'var(--color-crit)';
+      if (sec) sec.style.color = 'var(--color-crit)';
     }
   }
 
