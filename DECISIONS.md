@@ -138,7 +138,7 @@ The brief presents an inherent tension: **strict global priority ordering vs. lo
   * Ingestion utilizes asynchronous transactions with pipelined `executemany` across both `inspection_items` and `audit_events`. A 250-item flood persists in <20 milliseconds of database time.
 * **Unpredictability & Controllability:**
   * Runs continuous background bursts on randomized calm intervals (35s–75s) so reviewers meet floods mid-inspection.
-  * Provides synchronous and REST/CLI hooks (`POST /api/generator/burst`, `python scripts/run_generator.py --burst-now`) for deterministic evaluation and live video demonstration.
+  * Provides synchronous and REST/CLI hooks (`POST /api/generator/burst`, `python scripts/run_generator.py --burst-now`) for deterministic benchmark execution and automated testing.
 
 ---
 
@@ -236,12 +236,12 @@ The brief presents an inherent tension: **strict global priority ordering vs. lo
 
 * **Dual-View Operational Ergonomics:**
   * **Dedicated Single-Workstation Mode (`/?reviewer=reviewer_X`):** Clean, high-focus interface for human inspectors at industrial quality-control stations. Displays active part number, component classification, bounding dimensions, camera ID, AI defect confidence meter, and high-visibility priority badges (Critical 9–10 in Emergency Red, High 6–8 in Warning Amber, Routine 1–5 in Steel Blue).
-  * **6-Reviewer Concurrent Grid Mode ("God Mode"):** A real-time overview displaying all 6 reviewer stations side-by-side on a responsive 3x2 grid. Reviewers' active claims, lease status, and judgements update live, enabling line supervisors (and video demonstrations) to observe contention resolution and parallel throughput across the entire line simultaneously.
+  * **6-Reviewer Concurrent Grid Mode ("God Mode"):** A real-time overview displaying all 6 reviewer stations side-by-side on a responsive 3x2 grid. Reviewers' active claims, lease status, and judgements update live, enabling line supervisors to observe contention resolution and parallel throughput across the entire line simultaneously.
 
 * **Sub-Second Lease Countdown & Two-Way Heartbeat Lifecycle:**
   * While an item is actively held, a dynamic visual countdown bar ticks at 100ms intervals from 8.0s downward, shifting colors (green $\to$ amber $\to$ emergency red) as urgency increases.
   * An automated background timer sends a lightweight `HEARTBEAT` frame over the WebSocket every 2.5 seconds, renewing the database lease (`lease_expires_at = NOW() + 8s`) and keeping the visual bar topped up.
-  * **Walkaway Simulation Toggle:** A dedicated "Simulate Walkaway" button pauses automated heartbeats, allowing inspectors and evaluators to watch the lease expire to 0.0s and verify live sweeper reclamation returning the item to the backlog within the strictly bounded $<9.0s$ window.
+  * **Walkaway Simulation Toggle:** A dedicated "Simulate Walkaway" button pauses automated heartbeats, allowing inspectors to watch the lease expire to 0.0s and observe live sweeper reclamation returning the item to the backlog within the configured recovery window.
 
 * **Zero-Build Vanilla Architecture:**
   * Implemented in clean, modern HTML5, CSS3, and native ES6 JavaScript without external npm dependencies or complex build steps.
@@ -249,7 +249,7 @@ The brief presents an inherent tension: **strict global priority ordering vs. lo
 
 ---
 
-## 12. End-to-End Stress Verification & Browser E2E Results (Phase 7)
+## 11. End-to-End Stress Verification & Browser E2E Results (Phase 7)
 
 ### Standalone Stress Benchmark (`scripts/stress_test.py`)
 Under the prescribed stress scenario (a 250-item sudden flood cleared by 6 concurrent reviewer bot workers against the shared PostgreSQL queue):
@@ -260,7 +260,7 @@ Under the prescribed stress scenario (a 250-item sudden flood cleared by 6 concu
   - **90th percentile (p90):** `3.99 ms`
   - **95th percentile (p95):** `4.22 ms`
   - **99th percentile (p99):** `4.68 ms`
-  - **Max Latency:** `14.77 ms`
+  - **Observed Maximum:** `14.77 ms under tested conditions` (empirical observation under 250-item burst contention, not a universal theoretical bound).
 - **Core Queue Invariants Verified:**
   - **Zero Duplicate Claims:** `0` items assigned to more than one reviewer.
   - **Zero Dropped Items:** `250 / 250` items completed review with terminal states (`PASSED` / `FAILED`).
@@ -270,7 +270,7 @@ Under the prescribed stress scenario (a 250-item sudden flood cleared by 6 concu
 Executed 5 browser-level integration tests in headless Firefox (`tests/test_phase7_browser_e2e.py`):
 1. **6-Reviewer Simultaneous Screens (`test_browser_six_reviewers_simultaneous_screens`):** Opened 6 independent browser contexts; verified initial state hydration, live backlog counts, next-item preview, and active reviewer roster.
 2. **Concurrent Claiming Contention (`test_browser_concurrent_claiming_zero_double_assignments`):** All 6 reviewers clicked "CLAIM NEXT ITEM" simultaneously; verified each reviewer received a distinct item with zero duplicate part assignments.
-3. **Walkaway Recovery Bound (`test_browser_walkaway_recovery_and_sweeper_bound`):** Reviewer claimed an item and toggled "Simulate Walkaway" (heartbeats paused). The lease timed out and the background sweeper reclaimed the item to `PENDING` in **8.50 seconds** (enforcing the `< 9.0s` bound). The browser received `LEASE_LOST`, unlocked the desk to empty state, and another reviewer successfully claimed and reviewed the recovered item.
+3. **Walkaway Recovery Bound (`test_browser_walkaway_recovery_and_sweeper_bound`):** Reviewer claimed an item and toggled "Simulate Walkaway" (heartbeats paused). The lease timed out and the background sweeper reclaimed the item to `PENDING` in **8.50 seconds** (verified under the tested environment and conditions, providing 0.5s margin relative to the 9.0s target). The browser received `LEASE_LOST`, unlocked the desk to empty state, and another reviewer successfully claimed and reviewed the recovered item.
 4. **Multi-Tab Synchronization (`test_browser_multi_tab_synchronization`):** Two tabs for the same reviewer synchronized in real time; claiming or deciding an item on Tab 1 immediately updated Tab 2 via WebSocket push.
 5. **Zero-Polling Network Verification (`test_browser_zero_polling_verification`):** Intercepted all HTTP network requests during active queue operations; verified that zero polling requests were issued by the frontend. All state updates are pushed over WebSockets.
 
@@ -279,7 +279,7 @@ Executed 5 browser-level integration tests in headless Firefox (`tests/test_phas
 
 ---
 
-## 13. What We Would Do Next (Scaling to 10x Load)
+## 12. What We Would Do Next (Scaling to 10x Load)
 
 If the system were subjected to **10x higher volume** (50x arrivals = ~250 items/sec steady, ~2,500 item bursts, 60 reviewers):
 1. **Queue Partitioning / Priority Bucketing:** At 60 concurrent reviewers, index contention on the single `(priority DESC, arrival_time ASC)` head can introduce row-lock wait spikes in PostgreSQL. We would partition the queue into separate priority tiers (Critical, High, Routine) or shard across worker pools.

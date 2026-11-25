@@ -14,7 +14,7 @@ The application manages the human review stage of an automated visual inspection
 1. **Handout Atomicity (`SELECT ... FOR UPDATE SKIP LOCKED`):** Reviewers concurrently claim items with zero locking contention, zero double-claims, and zero blocking cascades. Candidate seek, row locking, state transition to `CLAIMED`, lease initialization, and audit event creation execute in a single atomic SQL transaction.
 2. **Zero Duplicate Claims:** Two concurrent reviewers can never receive the same inspection item under any load or burst condition.
 3. **One Active Item Per Reviewer:** Enforced via a database partial unique index (`CREATE UNIQUE INDEX idx_one_active_claim_per_reviewer ON inspection_items (claimed_by) WHERE status = 'CLAIMED'`). Multiple simultaneous claim requests from the same reviewer idempotently return their currently active item.
-4. **Bounded Walkaway Recovery (< 9.0s):** If a reviewer steps away, closes their browser, or loses network connectivity, their lease expires and an asynchronous background sweeper automatically reclaims the item back to `PENDING` within **< 9.0 seconds** (empirically measured at **8.06s – 8.50s**).
+4. **Bounded Walkaway Recovery (< 9.0s Target):** If a reviewer steps away, closes their browser, or loses network connectivity, their lease expires and an asynchronous background sweeper automatically reclaims the item back to `PENDING`. Configured with an 8.0s lease duration and a 1.0s sweeper cadence, yielding an observed recovery of **8.50 seconds** in browser E2E testing (providing 0.5s margin under active network/browser loop) and **8.06 seconds** in database sweeper audits.
 5. **Zero Frontend Polling:** All queue telemetry, backlog counts, active reviewer rosters, next-up previews, and lease updates are pushed immediately over persistent WebSockets with monotonic sequence ordering (`seq`) and UTC timestamps.
 6. **Single-Command Startup:** Starts entirely via `docker compose up --build`.
 
@@ -69,60 +69,151 @@ flowchart TD
 
 ---
 
-## 3. Quickstart (Single-Command Run)
+## 3. How to Run Locally
 
-### Prerequisites
-- Docker & Docker Compose (v2+)
+### Option A: Docker Compose (Recommended)
+This runs the complete system (PostgreSQL 16 Alpine + FastAPI Application) with healthchecks and automatic schema migration.
 
-### Launch Application
-Clone the repository and run:
 ```bash
+# 1. Clone or navigate to the project directory
+cd /path/to/realtime-review-queue
+
+# 2. Build and launch all containers
 docker compose up --build
 ```
 
-The system will build the Python FastAPI container, launch PostgreSQL 16 Alpine, verify the database schema and partial indexes, launch the background lease sweeper, and start listening on port `8000`.
+To stop the containers:
+```bash
+docker compose down
+```
 
-### Access Points
-- **Reviewer Workstations:** Open independent reviewer screens in separate browser tabs:
+### Option B: Native Local Setup (Python + PostgreSQL)
+If running directly on a host machine without Docker:
+
+```bash
+# 1. Ensure PostgreSQL is running and create the database
+createdb review_queue
+
+# 2. Create and activate a Python virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. Set environment variables (adjust credentials if needed)
+export POSTGRES_HOST=localhost
+export POSTGRES_PORT=5432
+export POSTGRES_USER=postgres
+export POSTGRES_PASSWORD=postgres
+export POSTGRES_DB=review_queue
+
+# 5. Launch FastAPI with Uvicorn
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+---
+
+## 4. How to Test and Interact with the Review System
+
+Once the application is running, open your web browser:
+
+### Step 1: Open Reviewer Screens
+- **6-Reviewer Grid Overview ("God Mode"):** Open [http://localhost:8000/](http://localhost:8000/).
+  - This overview displays all 6 workstations simultaneously, live backlog counters, active reviewer tags, defect category breakdowns, and generator controls.
+- **Dedicated Workstation Screens:** Open two or more independent reviewer tabs side by side:
   - Reviewer 1: [http://localhost:8000/?reviewer=reviewer_1](http://localhost:8000/?reviewer=reviewer_1)
   - Reviewer 2: [http://localhost:8000/?reviewer=reviewer_2](http://localhost:8000/?reviewer=reviewer_2)
   - Reviewer 3: [http://localhost:8000/?reviewer=reviewer_3](http://localhost:8000/?reviewer=reviewer_3)
-  - Reviewer 4: [http://localhost:8000/?reviewer=reviewer_4](http://localhost:8000/?reviewer=reviewer_4)
-  - Reviewer 5: [http://localhost:8000/?reviewer=reviewer_5](http://localhost:8000/?reviewer=reviewer_5)
-  - Reviewer 6: [http://localhost:8000/?reviewer=reviewer_6](http://localhost:8000/?reviewer=reviewer_6)
-- **6-Reviewer Grid Overview ("God Mode"):** [http://localhost:8000/](http://localhost:8000/) (Toggle to "Grid Overview" to monitor all 6 workstations simultaneously).
-- **Health Check:** [http://localhost:8000/health](http://localhost:8000/health)
-- **Swagger / OpenAPI Documentation:** [http://localhost:8000/docs](http://localhost:8000/docs)
+  - (Reviewers 4 through 6 can be accessed via `reviewer_4`, `reviewer_5`, `reviewer_6` or via the top-bar dropdown).
+
+### Step 2: Ingest Inspection Items
+Use the built-in generator panel at the top of the interface:
+- **Seed 10 Items:** Instantly injects 10 test parts to test claim and review mechanics.
+- **Trigger 250 Burst (<10s):** Injects a flood of 250 items over 8.0 seconds (~31 items/sec) to test high-contention concurrent claiming.
+- **Start Steady Flow:** Toggles a continuous background trickle of ~5 items/second.
+
+### Step 3: Test Concurrent Atomic Claiming & Reviews
+1. On **Reviewer 1's** screen, click **"CLAIM NEXT ITEM"** (or press `Space`).
+2. Simultaneously on **Reviewer 2's** screen, click **"CLAIM NEXT ITEM"** (or press `Space`).
+3. Notice:
+   - Reviewer 1 and Reviewer 2 receive distinct, non-overlapping parts.
+   - The queue counters update instantly on both screens via WebSocket push.
+   - The active inspection card displays component name, defect type, bounding dimensions, camera ID, and AI confidence score.
+4. Submit an inspection judgement:
+   - Click **PASS (Accept)** or press `P`.
+   - Click **FAIL (Reject)** or press `F`.
+   - Click **Release Back to Queue** or press `R` to voluntarily return the item to `PENDING`.
+
+### Step 4: Test Walkaway Recovery (< 9.0s Bound)
+1. On Reviewer 1's screen, claim an item.
+2. Click **"Simulate Walkaway (Pause Heartbeats)"**.
+3. Watch the visual lease bar count down from 8.0s to 0.0s (automated WebSocket heartbeats are suspended).
+4. At ~8.5 seconds:
+   - Reviewer 1's desk automatically clears and unlocks back to the empty state with a "Lease Expired" notification.
+   - Switch to Reviewer 2's screen and click **"CLAIM NEXT ITEM"**: Reviewer 2 immediately receives the exact item abandoned by Reviewer 1.
+
+### Step 5: Verify Zero Polling
+1. Open Browser DevTools (`F12`), switch to the **Network** tab, and filter by `Fetch/XHR`.
+2. Notice that **no periodic HTTP polling requests** are sent.
+3. Switch filter to `WS` (WebSockets) to view the incoming push frames (`QUEUE_UPDATE`, `CLAIM_RESULT`, `LEASE_LOST`) streaming in real time.
 
 ---
 
-## 4. Workstation Features & User Interface
+## 5. Keyboard Shortcuts
 
-The frontend is implemented in **Vanilla HTML5, CSS3, and ES6 JavaScript** with zero external JavaScript dependencies or build tools.
-
-### Key Capabilities
-- **Inspection Workspace:** Displays part number, component classification (e.g., Turbine Blade, Fuel Injection Nozzle), defect type (e.g., Structural Fracture, Porosity), camera station ID, bounding dimensions, and AI defect confidence score with a visual progress bar.
-- **Dynamic Priority Badges:**
-  - `Priority 9–10`: **CRITICAL** (Emergency Red)
-  - `Priority 6–8`: **HIGH** (Warning Amber)
-  - `Priority 1–5`: **ROUTINE** (Steel Blue)
-- **Sub-Second Lease Countdown:** 8.0-second visual lease bar with 100ms smooth decrement and color shifts (Green $\to$ Amber $\to$ Red).
-- **Two-Way Heartbeats:** Automated 2.5-second WebSocket heartbeat extends the active lease in PostgreSQL.
-- **Simulate Walkaway:** One-click toggle pauses heartbeats, demonstrating lease expiration and automatic sweeper recovery within `< 9.0s`.
-- **Live Next Up Preview:** Displays the highest priority item waiting in the queue before claiming.
-- **Load Generator Controls:**
-  - `Seed 10 Items`: Instant test data.
-  - `Trigger 250 Burst (<10s)`: Dispatches 250 items over 8 seconds (~31 items/s).
-  - `Start / Stop Steady Flow`: Toggles ~5 items/s trickle feed.
-- **Ergonomic Keyboard Shortcuts:**
-  - `Space` or `Enter`: Claim next item
-  - `P`: PASS decision
-  - `F`: FAIL decision
-  - `R`: RELEASE item back to queue
+For ergonomic high-speed inspection:
+- `Space` or `Enter`: Claim next highest priority item
+- `P`: PASS / Accept component
+- `F`: FAIL / Reject component
+- `R`: Release component back to PENDING queue
 
 ---
 
-## 5. API Reference
+## 6. Automated Testing & Benchmarks
+
+The automated test suite runs against the real PostgreSQL database with zero mocks.
+
+### Run All 44 Automated Tests
+```bash
+pytest -v tests/test_phase*.py
+```
+
+### Run Playwright Headless Firefox E2E Suite
+```bash
+pytest -v tests/test_phase7_browser_e2e.py
+```
+
+### Run Standalone CLI Stress Benchmark
+```bash
+python scripts/stress_test.py
+```
+
+---
+
+## 7. Measured Performance Benchmarks
+
+All metrics reflect real empirical measurements executed on the benchmark harness:
+
+| Metric | Measured Value | Notes |
+|---|---|---|
+| **250-Item Burst Ingestion Duration** | **8.57 seconds** (~29.2 items/s) | Meets requirement of $< 10.0$ seconds |
+| **6-Reviewer Clearing Throughput** | **29.15 items/sec** (250 items in 8.58s) | Sustained concurrent review under burst |
+| **Database Index Scan (`EXPLAIN ANALYZE`)** | **0.398 ms** | Scan time on `idx_inspection_items_pending` |
+| **Application Claim Latency (Median p50)** | **3.08 ms** | Full HTTP/WS roundtrip under burst contention |
+| **Application Claim Latency (90th percentile p90)** | **3.99 ms** | Full HTTP/WS roundtrip under burst contention |
+| **Application Claim Latency (95th percentile p95)** | **4.22 ms** | Full HTTP/WS roundtrip under burst contention |
+| **Application Claim Latency (99th percentile p99)** | **4.68 ms** | Full HTTP/WS roundtrip under burst contention |
+| **Observed Maximum Claim Latency** | **14.77 ms under tested conditions** | Empirical observation under 250-item contention |
+| **Duplicate Assignments** | **0** | Verified across all 250 claims |
+| **Dropped / Lost Items** | **0** | All 250 items reached terminal state |
+| **Audit Completeness Ratio** | **3.00** (750 events for 250 items) | Exactly 1 event per transition (`CREATED`, `CLAIMED`, `PASSED`/`FAILED`) |
+| **Walkaway Recovery (Browser E2E)** | **8.50 seconds** | Verified under tested conditions (0.5s margin relative to 9.0s target) |
+| **Walkaway Recovery (Database Sweeper)** | **8.06 seconds** | Measured in PostgreSQL audit logs under tested conditions |
+
+---
+
+## 8. API Reference
 
 ### REST Endpoints
 | Method | Endpoint | Description |
@@ -140,105 +231,3 @@ The frontend is implemented in **Vanilla HTML5, CSS3, and ES6 JavaScript** with 
 ### WebSocket Channels
 - `/ws/reviewer/{reviewer_id}`: Bidirectional reviewer channel supporting instant `CLAIM`, `DECIDE`, `RELEASE`, and `HEARTBEAT` messages, initial state hydration, and targeted `LEASE_LOST` push alerts.
 - `/ws/queue`: Read-only broadcast channel for telemetry monitors, supervisor dashboards, and multi-screen synchronization.
-
----
-
-## 6. Verification & Automated Test Suite
-
-The test suite runs against the live PostgreSQL database with zero mocks.
-
-### Run All 44 Automated Tests
-```bash
-pytest -v tests/test_phase*.py
-```
-
-### Test Coverage Across All Phases
-1. `tests/test_phase1_db.py`: Database connectivity, partial indexes, explain analyze, and concurrency locks (4 tests).
-2. `tests/test_phase2_generator.py`: Priority distribution (10% critical, 25% high, 65% routine), burst shaping (<10s), steady flow (~5/s), and REST APIs (5 tests).
-3. `tests/test_phase3_queue.py` & `test_phase3_edge_cases.py`: Atomic handout, release/reclaim lifecycles, unauthorized decision rejection, simultaneous claim race conditions, 250-item burst contention, and audit consistency (11 tests).
-4. `tests/test_phase4_lease_recovery.py`: Two-way heartbeat extension, expired lease rejection, background sweeper recovery, bounded recovery verification (<9s), and multi-item recovery under active churn (8 tests).
-5. `tests/test_phase5_websocket.py`: WebSocket hydration, two-way heartbeats, live arrival broadcasts, malformed message rejection, multi-tab sync, and monotonic sequence ordering (9 tests).
-6. `tests/test_phase6_frontend.py`: Static asset delivery, workstation mode, and grid view template serving (2 tests).
-7. `tests/test_phase7_browser_e2e.py`: Playwright headless Firefox end-to-end integration tests (5 tests).
-
-### Standalone CLI Stress Benchmark
-Execute the standalone stress benchmark measuring exact burst ingestion and clearing throughput:
-```bash
-python scripts/stress_test.py
-```
-
----
-
-## 7. Measured Performance Benchmarks
-
-All metrics reflect real empirical measurements executed on the benchmark harness:
-
-| Metric | Measured Value | Specification Requirement |
-|---|---|---|
-| **250-Item Burst Ingestion Duration** | **8.57 seconds** (~29.2 items/s) | $< 10.0$ seconds |
-| **6-Reviewer Clearing Throughput** | **29.15 items/sec** (250 items in 8.58s) | Full burst cleared without stall |
-| **Claim Latency (Median p50)** | **3.08 ms** | Low sub-second latency |
-| **Claim Latency (90th percentile p90)** | **3.99 ms** | Low sub-second latency |
-| **Claim Latency (95th percentile p95)** | **4.22 ms** | Low sub-second latency |
-| **Claim Latency (99th percentile p99)** | **4.68 ms** | Low sub-second latency |
-| **Duplicate Assignments** | **0** | Exactly 0 (Strict Invariant) |
-| **Dropped / Lost Items** | **0** | Exactly 0 (Strict Invariant) |
-| **Audit Completeness Ratio** | **3.00** (750 events for 250 items) | Exactly 1 event per transition |
-| **Walkaway Recovery Bound (Firefox E2E)** | **8.50 seconds** | $< 9.0$ seconds |
-| **Walkaway Recovery Bound (DB Sweeper)** | **8.06 seconds** | $< 9.0$ seconds |
-
----
-
-## 8. Video Walkthrough & Evaluation Script
-
-Use this structured walkthrough script when demonstrating or evaluating the project against the 4 core prompt questions:
-
-### Question 1: How is handout atomicity guaranteed under burst contention?
-- **Demonstration:**
-  1. Open the 6-reviewer grid view (`http://localhost:8000/`).
-  2. Click "Trigger 250 Burst" in the generator panel.
-  3. Notice how all 6 reviewer screens continuously claim parts concurrently without pausing or throwing errors.
-  4. Run `python scripts/stress_test.py` to observe that across 250 claims under burst contention, **0 double-assignments** occurred and median claim latency was **3.08ms**.
-- **Explanation:**
-  - Handout atomicity is guaranteed at the database engine level via PostgreSQL’s `SELECT ... FOR UPDATE SKIP LOCKED` inside a multi-statement Common Table Expression (CTE).
-  - The query finds the single highest-priority pending item (`idx_inspection_items_pending`), acquires an exclusive row lock, transitions the status to `'CLAIMED'`, assigns the reviewer ID, calculates the lease deadline, and appends an immutable audit event—all in one atomic statement.
-  - Reviewers never block each other: if Reviewer 1 locks item A, Reviewer 2 skips item A without waiting and atomically claims item B.
-  - To prevent TOCTOU races from simultaneous clicks by the same reviewer, a database-level partial unique index (`idx_one_active_claim_per_reviewer`) physically prevents two active claims per reviewer.
-
-### Question 2: What is the walked-away item recovery model and how is the bound derived?
-- **Demonstration:**
-  1. In Reviewer 1's window, click "CLAIM NEXT ITEM".
-  2. The active workspace appears with an 8.0-second countdown bar.
-  3. Click "Simulate Walkaway (Pause Heartbeats)".
-  4. Watch the visual lease bar count down from 8.0s to 0.0s.
-  5. At exactly ~8.5 seconds, the sweeper reclaims the item: Reviewer 1's desk automatically resets to the empty state with a "Lease Expired" notification.
-  6. Switch to Reviewer 2 and click "CLAIM NEXT ITEM": Reviewer 2 immediately receives the exact item abandoned by Reviewer 1.
-- **Mathematical Bound Derivation:**
-  - Base lease duration: **8.0 seconds** (`lease_expires_at = NOW() + INTERVAL '8 seconds'`).
-  - Background sweeper cadence: **1.0 second** (`SELECT ... WHERE status = 'CLAIMED' AND lease_expires_at < NOW() FOR UPDATE SKIP LOCKED`).
-  - Worst-case timeline: An inspector claims an item and instantly disconnects at $T = 0.0s$. The lease expires at $T = 8.0s$. The sweeper detects and reclaims the row at the next sweep tick ($T \le 8.0 + 1.0 = 9.0s$).
-  - Therefore, the recovery bound is mathematically guaranteed to be **$< 9.0$ seconds**.
-  - Empirically verified in Playwright Firefox tests at **8.50s** and in PostgreSQL audit logs at **8.06s**.
-
-### Question 3: How does the live push broadcast layer prevent frontend polling while keeping 6 screens synchronized?
-- **Demonstration:**
-  1. Open Reviewer 1 on the left side of the screen and Reviewer 2 on the right side.
-  2. Reviewer 1 clicks "CLAIM NEXT ITEM".
-  3. Notice that Reviewer 2's "Pending" count drops and "Active Reviewers" list updates instantly with zero delay.
-  4. Open Browser DevTools Network tab: Filter by `Fetch/XHR` and confirm **zero periodic HTTP GET requests**.
-  5. Filter by `WS` to observe incoming `QUEUE_UPDATE` frames pushed by the server.
-- **Explanation:**
-  - The application establishes a persistent WebSocket connection upon loading (`/ws/reviewer/{reviewer_id}`).
-  - Whenever an item arrives, is claimed, is judged, is released, or is recovered by the sweeper, the queue engine triggers an asynchronous broadcast hook.
-  - The server computes fresh aggregate queue telemetry and pushes `QUEUE_UPDATE` frames concurrently across all connected sockets via `asyncio.gather` with per-socket 1.0s timeout protection and automatic stale socket pruning.
-  - Every broadcast carries an auto-incrementing integer sequence ID (`seq`) and UTC timestamp so clients discard out-of-order broadcasts.
-
-### Question 4: What are the empirical latency and throughput results measured under full load?
-- **Demonstration:**
-  - Present Section 7 of the README or run `python scripts/stress_test.py`:
-  - Show the measured percentiles:
-    - Median (p50): **3.08 ms**
-    - 90th percentile (p90): **3.99 ms**
-    - 99th percentile (p99): **4.68 ms**
-  - Show that a 250-item flood is ingested in **8.57s** (<10s ceiling) and cleared at **29.15 items/sec** by 6 reviewers.
-  - Highlight the 100% audit completeness ratio (`3:1` audit events to items) and `0` duplicate claims.
