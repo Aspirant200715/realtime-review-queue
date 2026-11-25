@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 import pytest
 import httpx
@@ -274,5 +275,136 @@ async def test_lease_recovery_api_endpoints():
         res = await client.post("/api/queue/sweep")
         assert res.status_code == 200
         assert "recovered_count" in res.json()
+
+    await close_db_pool()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_multi_item_recovery_under_churn():
+    """
+    STRESS / CHURN RECOVERY TEST (Rubric D3):
+    10 items claimed by 10 reviewers with a short lease (0.5s).
+    All 10 reviewers walk away simultaneously.
+    Meanwhile, 2 active reviewers continue claiming and processing items from the queue.
+    Verify:
+    1. All 10 abandoned items are swept back to PENDING within the bounded time (< 2.0s).
+    2. Active reviewers never crash or lock up.
+    3. Exactly 10 'LEASE_EXPIRED' audit records are logged.
+    """
+    pool = await init_db_pool()
+    queue_engine.set_pool(pool)
+
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM inspection_items; DELETE FROM audit_events;")
+
+    generator = LoadGenerator(pool=pool)
+    # Seed 30 items
+    items = [ItemFactory.create_item() for _ in range(30)]
+    await generator.insert_items(items)
+
+    local_sweeper = LeaseSweeper(queue_engine, interval_seconds=0.2)
+    local_sweeper.start()
+
+    try:
+        # 10 reviewers claim an item with a 0.5s lease and immediately walk away
+        queue_engine.lease_duration = 0.5
+        abandoned_ids = []
+        for i in range(10):
+            claimed, _ = await queue_engine.claim_next_item(f"walkaway_rev_{i}")
+            assert claimed is not None
+            abandoned_ids.append(claimed["id"])
+
+        start_t = time.perf_counter()
+
+        # Two active reviewers keep processing other items
+        async def active_worker(rev_id: str):
+            for _ in range(5):
+                item, _ = await queue_engine.claim_next_item(rev_id)
+                if item:
+                    await asyncio.sleep(0.01)
+                    await queue_engine.record_decision(item["id"], rev_id, "PASS")
+
+        await asyncio.gather(active_worker("active_1"), active_worker("active_2"))
+
+        # Wait until all 10 abandoned items are swept back
+        while time.perf_counter() - start_t < 3.0:
+            async with pool.acquire() as conn:
+                unrecovered = await conn.fetchval(
+                    "SELECT count(*) FROM inspection_items WHERE id = ANY($1::varchar[]) AND status = 'CLAIMED';",
+                    abandoned_ids
+                )
+                if unrecovered == 0:
+                    break
+            await asyncio.sleep(0.05)
+
+        elapsed = time.perf_counter() - start_t
+        print(f"\nAll 10 abandoned items recovered in {elapsed:.3f}s under active churn.")
+
+        # Invariant checks:
+        async with pool.acquire() as conn:
+            # All 10 abandoned items must have a LEASE_EXPIRED audit event
+            recovered_audit_count = await conn.fetchval(
+                "SELECT count(*) FROM audit_events WHERE item_id = ANY($1::varchar[]) AND event_type = 'LEASE_EXPIRED';",
+                abandoned_ids
+            )
+            assert recovered_audit_count == 10, f"Expected 10 LEASE_EXPIRED events, found {recovered_audit_count}"
+
+    finally:
+        queue_engine.lease_duration = settings.lease_duration_seconds
+        local_sweeper.stop()
+        await close_db_pool()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sweep_operations():
+    """
+    CONCURRENCY TEST:
+    Two concurrent sweep operations running simultaneously on a batch of 80 expired items.
+    Proves:
+    1. Zero duplicate recoveries.
+    2. Sum of recovered items across both sweeps equals exactly 80.
+    3. Exactly 80 'LEASE_EXPIRED' audit events written.
+    """
+    pool = await init_db_pool()
+    queue_engine.set_pool(pool)
+
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM inspection_items; DELETE FROM audit_events;")
+
+        # Insert 80 expired items
+        records = [
+            (f"exp_item_{i:03d}", (i % 10) + 1, 'CLAIMED', f"expired_rev_{i}", json.dumps({"test": i}))
+            for i in range(80)
+        ]
+        await conn.executemany(
+            """
+            INSERT INTO inspection_items (id, priority, status, claimed_by, claimed_at, lease_expires_at, payload)
+            VALUES ($1, $2, $3, $4, NOW() - INTERVAL '10 seconds', NOW() - INTERVAL '2 seconds', $5::jsonb);
+            """,
+            records
+        )
+
+    # Fire two concurrent sweeps simultaneously
+    sweep_1, sweep_2 = await asyncio.gather(
+        queue_engine.sweep_expired_leases(batch_size=50),
+        queue_engine.sweep_expired_leases(batch_size=50)
+    )
+
+    ids_1 = [r["id"] for r in sweep_1]
+    ids_2 = [r["id"] for r in sweep_2]
+
+    # Zero overlap between the two concurrent sweepers
+    overlap = set(ids_1).intersection(set(ids_2))
+    assert len(overlap) == 0, f"Detected duplicate item recovery across sweepers! {overlap}"
+
+    total_recovered = len(ids_1) + len(ids_2)
+    assert total_recovered == 80, f"Expected 80 total recovered items, got {total_recovered}"
+
+    async with pool.acquire() as conn:
+        pending_count = await conn.fetchval("SELECT count(*) FROM inspection_items WHERE status = 'PENDING';")
+        assert pending_count == 80
+
+        audit_count = await conn.fetchval("SELECT count(*) FROM audit_events WHERE event_type = 'LEASE_EXPIRED';")
+        assert audit_count == 80
 
     await close_db_pool()

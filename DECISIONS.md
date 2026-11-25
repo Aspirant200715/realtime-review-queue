@@ -90,7 +90,7 @@ The brief presents an inherent tension: **strict global priority ordering vs. lo
   * The operation executes:
     `UPDATE inspection_items SET lease_expires_at = NOW() + INTERVAL '8 seconds' WHERE id = $1 AND status = 'CLAIMED' AND claimed_by = $2 AND lease_expires_at > NOW()`
   * If a reviewer’s browser freezes for >8 seconds and the sweeper reclaims the item, any late heartbeat is rejected with HTTP 409 Conflict (`ItemNotClaimedError`), informing the client that the lease was forfeited.
-* **Sweeper Concurrency & Atomicity:**
+* **Sweeper Concurrency & Continuous Drain Loop:**
   * The background sweeper executes:
     ```sql
     WITH expired_items AS (
@@ -98,7 +98,7 @@ The brief presents an inherent tension: **strict global priority ordering vs. lo
         FROM inspection_items
         WHERE status = 'CLAIMED' AND lease_expires_at < NOW()
         ORDER BY lease_expires_at ASC
-        LIMIT 50
+        LIMIT $1
         FOR UPDATE SKIP LOCKED
     ),
     recovered_items AS (
@@ -116,8 +116,11 @@ The brief presents an inherent tension: **strict global priority ordering vs. lo
     FROM recovered_items;
     ```
   * Utilizing `SKIP LOCKED` ensures that if a reviewer submits a PASS/FAIL at the exact microsecond of lease expiry, the sweeper does not deadlock or block. Either the decision commits, or the sweeper reclaims the row.
-* **Empirical Latency Test (`test_bounded_recovery_time_enforcement`):**
-  * Tested with a 0.8s lease and 0.2s sweeper: Abandoned item was detected, reclaimed to `'PENDING'`, and observed available for claim in **0.954 seconds**—strictly within the theoretical bound.
+  * **Continuous Drain Loop:** If a sweep recovers a full batch ($N = 100$), the sweeper immediately loops without sleeping until all expired items are reclaimed. This prevents large bursts of abandoned items (>50 or >100) from waiting across multiple 1-second sleep intervals, guaranteeing that even widespread network cuts or reviewer dropoffs respect the `< 9.0s` bound.
+* **Empirical Latency & Churn Tests (`tests/test_phase4_lease_recovery.py`):**
+  * **Single Item Recovery:** Tested with a 0.8s lease and 0.2s sweeper: Abandoned item was detected, reclaimed to `'PENDING'`, and observed available for claim in **0.954 seconds**.
+  * **Multi-Item Recovery Under Active Churn:** 10 items abandoned simultaneously while 2 active reviewers continuously drained other items from the queue. All 10 abandoned items were cleanly reclaimed with `'LEASE_EXPIRED'` audit records and recycled into the backlog without blocking active reviewers.
+  * **Concurrent Sweepers:** 2 simultaneous sweep operations executed against 80 expired items: recovered all 80 items with zero overlap and zero duplicate audit events.
 
 ---
 

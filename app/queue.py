@@ -433,7 +433,7 @@ class QueueEngine:
             logger.debug(f"Lease renewed for item {item_id} by {reviewer_id}: {res['remaining_lease_seconds']}s remaining.")
             return res
 
-    async def sweep_expired_leases(self, batch_size: int = 50) -> List[Dict[str, Any]]:
+    async def sweep_expired_leases(self, batch_size: int = 100) -> List[Dict[str, Any]]:
         """
         Scans for items where status = 'CLAIMED' AND lease_expires_at < NOW().
         Atomically resets them to 'PENDING', clears claimed_by, and logs 'LEASE_EXPIRED' audit event.
@@ -503,11 +503,15 @@ class LeaseSweeper:
         logger.info(f"Lease sweeper started. Running every {self.interval:.1f}s.")
         while self.is_running:
             try:
-                recovered = await self.engine.sweep_expired_leases()
-                self.total_sweeps += 1
-                self.last_sweep_time = datetime.now(timezone.utc)
-                if recovered:
-                    self.total_recovered += len(recovered)
+                # Continuous drain loop: if a full batch was recovered, drain immediately without sleeping
+                while self.is_running:
+                    recovered = await self.engine.sweep_expired_leases(batch_size=100)
+                    self.total_sweeps += 1
+                    self.last_sweep_time = datetime.now(timezone.utc)
+                    if recovered:
+                        self.total_recovered += len(recovered)
+                    if len(recovered) < 100:
+                        break
             except asyncio.CancelledError:
                 break
             except Exception as e:
