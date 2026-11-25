@@ -353,7 +353,10 @@ class QueueEngine:
                     COUNT(*) FILTER (WHERE status = 'CLAIMED' AND lease_expires_at > NOW()) AS claimed,
                     COUNT(*) FILTER (WHERE status = 'PASSED') AS passed,
                     COUNT(*) FILTER (WHERE status = 'FAILED') AS failed,
-                    COUNT(*) AS total
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE status = 'PENDING' AND priority >= 9) AS pending_crit,
+                    COUNT(*) FILTER (WHERE status = 'PENDING' AND priority >= 6 AND priority < 9) AS pending_high,
+                    COUNT(*) FILTER (WHERE status = 'PENDING' AND priority < 6) AS pending_rout
                 FROM inspection_items;
                 """
             )
@@ -390,6 +393,9 @@ class QueueEngine:
                 "passed_count": counts["passed"] if counts else 0,
                 "failed_count": counts["failed"] if counts else 0,
                 "total_items": counts["total"] if counts else 0,
+                "pending_crit": counts["pending_crit"] if counts else 0,
+                "pending_high": counts["pending_high"] if counts else 0,
+                "pending_rout": counts["pending_rout"] if counts else 0,
                 "active_reviewers": [dict(r) for r in active_revs],
                 "active_claims": active_claims,
                 "next_preview": preview

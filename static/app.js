@@ -79,6 +79,7 @@
     btnSteady: document.getElementById('btn-steady'),
     btnSteadyText: document.getElementById('btn-steady-text'),
     btnSeed: document.getElementById('btn-seed'),
+    btnReset: document.getElementById('btn-reset'),
 
     // Desk
     deskEmptyState: document.getElementById('desk-empty-state'),
@@ -308,6 +309,11 @@
     el.statClaimed.textContent = s.claimed_count ?? 0;
     el.statPassed.textContent = s.passed_count ?? 0;
     el.statFailed.textContent = s.failed_count ?? 0;
+
+    // Breakdown pills
+    if (el.badgeCrit) el.badgeCrit.textContent = `${s.pending_crit ?? 0} Crit`;
+    if (el.badgeHigh) el.badgeHigh.textContent = `${s.pending_high ?? 0} High`;
+    if (el.badgeRout) el.badgeRout.textContent = `${s.pending_rout ?? 0} Rout`;
 
     // Active reviewers list
     const activeRevs = s.active_reviewers || [];
@@ -578,6 +584,16 @@
     }
   }
 
+  async function resetQueue() {
+    try {
+      await fetch('/api/queue/reset', { method: 'POST' });
+      logActivity('system', 'Queue reset to clean state (0 pending items).');
+      clearActiveItem();
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
   // --- 6-Reviewer Grid Mode ("God Mode") ---
   function initGridView() {
     const container = el.reviewersGrid;
@@ -769,6 +785,7 @@
     el.btnBurst.addEventListener('click', triggerBurst);
     el.btnSteady.addEventListener('click', toggleSteadyFlow);
     el.btnSeed.addEventListener('click', seedTenItems);
+    if (el.btnReset) el.btnReset.addEventListener('click', resetQueue);
     el.btnClaimAll.addEventListener('click', claimAllSixReviewers);
 
     // Global keyboard shortcuts

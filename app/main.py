@@ -258,6 +258,30 @@ async def trigger_sweep():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/queue/reset")
+async def reset_queue():
+    """
+    Clears all queue items and audit events for demo/testing reset.
+    """
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("TRUNCATE inspection_items, audit_events RESTART IDENTITY;")
+        stats = await queue_engine.get_queue_stats()
+        await ws_manager.broadcast({
+            "type": "QUEUE_UPDATE",
+            "trigger": "RESET",
+            "event_data": {"message": "Queue reset"},
+            "stats": stats,
+            "seq": ws_manager.get_next_seq(),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+        return {"status": "ok", "message": "Queue reset successfully"}
+    except Exception as e:
+        logger.error(f"Error resetting queue: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/queue/sweeper/status")
 async def get_sweeper_status():
     """Returns telemetry of the background lease sweeper service."""
