@@ -279,7 +279,15 @@
       }
     } else if (trigger === 'LEASE_RECOVERED') {
       const count = data.count || 0;
-      logActivity('recovery', `Sweeper reclaimed ${count} walked-away items (<9s bound enforced).`);
+      const recovered = data.recovered_items || [];
+      const lostItem = recovered.find(r => r.claimed_by === state.reviewerId);
+      if (lostItem) {
+        logActivity('recovery', `ALERT: Lease expired for ${lostItem.id}! Sweeper recovered item back to queue.`);
+        clearActiveItem();
+        alertLeaseLost();
+      } else {
+        logActivity('recovery', `Sweeper reclaimed ${count} walked-away items (<9s bound enforced).`);
+      }
     }
 
     // Update Next Up Preview
@@ -795,8 +803,14 @@
     // Check URL parameters for ?reviewer=reviewer_X
     const urlParams = new URLSearchParams(window.location.search);
     const revParam = urlParams.get('reviewer');
-    if (revParam && el.reviewerSelect.querySelector(`option[value="${revParam}"]`)) {
+    if (revParam) {
       state.reviewerId = revParam;
+      if (!el.reviewerSelect.querySelector(`option[value="${revParam}"]`)) {
+        const opt = document.createElement('option');
+        opt.value = revParam;
+        opt.textContent = revParam;
+        el.reviewerSelect.appendChild(opt);
+      }
       el.reviewerSelect.value = revParam;
     }
 
