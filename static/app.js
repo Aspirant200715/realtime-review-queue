@@ -211,22 +211,25 @@
       case 'CLAIM_RESULT':
         if (msg.item) {
           setActiveItem(msg.item);
-          logActivity('claim', `${state.reviewerId} claimed ${msg.item.payload?.part_id || msg.item.id} (P${msg.item.priority})`);
+          const partLabel = msg.item.payload?.part_number || msg.item.payload?.part_id || msg.item.id;
+          logActivity('claim', `${state.reviewerId} claimed ${partLabel} (P${msg.item.priority})`);
         } else {
           logActivity('system', 'Queue empty. No pending items available.');
         }
         break;
 
       case 'DECISION_ACK':
+        const decPart = msg.item?.payload?.part_number || msg.item?.payload?.part_id || msg.item?.id;
         logActivity(
           msg.decision === 'PASS' ? 'pass' : 'fail',
-          `Item ${msg.item?.payload?.part_id || msg.item?.id} recorded as ${msg.decision}`
+          `Item ${decPart} recorded as ${msg.decision}`
         );
         clearActiveItem();
         break;
 
       case 'RELEASE_ACK':
-        logActivity('system', `Item ${msg.item?.payload?.part_id || msg.item?.id} returned to PENDING queue.`);
+        const relPart = msg.item?.payload?.part_number || msg.item?.payload?.part_id || msg.item?.id;
+        logActivity('system', `Item ${relPart} returned to PENDING queue.`);
         clearActiveItem();
         break;
 
@@ -260,20 +263,20 @@
       logActivity('arrival', `+${msg.arrival_count} new inspection items arrived on line.`);
     } else if (trigger === 'CLAIM') {
       const rev = data.reviewer_id;
-      const part = data.item?.payload?.part_id || data.item?.id;
+      const part = data.item?.payload?.part_number || data.item?.payload?.part_id || data.item?.id;
       if (rev !== state.reviewerId) {
         logActivity('claim', `${rev} claimed ${part} (P${data.item?.priority})`);
       }
     } else if (trigger === 'DECISION') {
       const rev = data.reviewer_id;
       const dec = data.decision;
-      const part = data.item?.payload?.part_id || data.item?.id;
+      const part = data.item?.payload?.part_number || data.item?.payload?.part_id || data.item?.id;
       if (rev !== state.reviewerId) {
         logActivity(dec === 'PASS' ? 'pass' : 'fail', `${rev} judged ${part} as ${dec}`);
       }
     } else if (trigger === 'RELEASE') {
       const rev = data.reviewer_id;
-      const part = data.item?.payload?.part_id || data.item?.id;
+      const part = data.item?.payload?.part_number || data.item?.payload?.part_id || data.item?.id;
       if (rev !== state.reviewerId) {
         logActivity('system', `${rev} released ${part} back to queue`);
       }
@@ -339,7 +342,7 @@
     el.nextPreviewBox.innerHTML = `
       <div class="preview-item-box">
         <div class="preview-top">
-          <span class="preview-part">${payload.part_id || preview.id}</span>
+          <span class="preview-part">${payload.part_number || payload.part_id || preview.id}</span>
           <span class="priority-badge ${prioClass}">P${preview.priority} // ${prioLabel}</span>
         </div>
         <div class="preview-defect">${payload.defect_type || 'Inspection Item'}</div>
@@ -383,7 +386,7 @@
     el.btnWalkaway.textContent = '⏸ Simulate Walkaway (Pause Heartbeat)';
 
     const payload = item.payload || {};
-    el.itemPartId.textContent = payload.part_id || item.id;
+    el.itemPartId.textContent = payload.part_number || payload.part_id || item.id;
     el.itemComponent.textContent = payload.component || 'Aircraft Turbine Component';
     el.itemDefectType.textContent = payload.defect_type || 'Visual Anomaly';
     el.itemCamera.textContent = payload.camera_id || 'CAM-ALPHA-01';
@@ -633,11 +636,13 @@
       const p = item.priority;
       const prioClass = p >= 9 ? 'priority-crit' : (p >= 6 ? 'priority-high' : 'priority-rout');
       const payload = item.payload || {};
+      const partDisplay = payload.part_number || payload.part_id || item.id;
+      const compDisplay = payload.component ? `<span style="font-size: 11px; color: var(--text-muted); font-weight: 500;"> • ${payload.component}</span>` : '';
 
       body.innerHTML = `
         <div class="grid-desk-active">
           <div class="grid-part-row">
-            <span class="part-id">${payload.part_id || item.id}</span>
+            <span class="part-id">${partDisplay}${compDisplay}</span>
             <span class="priority-badge ${prioClass}">P${p}</span>
           </div>
           <div class="grid-defect-text">${payload.defect_type || 'Defect'}</div>
