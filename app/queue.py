@@ -367,6 +367,21 @@ class QueueEngine:
                 """
             )
 
+            active_claims_rows = await conn.fetch(
+                """
+                SELECT id, priority, status, payload, arrival_time, claimed_by, claimed_at, lease_expires_at,
+                       ROUND(EXTRACT(EPOCH FROM (lease_expires_at - NOW()))::numeric, 1) AS remaining_lease_seconds
+                FROM inspection_items
+                WHERE status = 'CLAIMED' AND lease_expires_at > NOW() AND claimed_by IS NOT NULL;
+                """
+            )
+            active_claims = []
+            for r in active_claims_rows:
+                item_dict = dict(r)
+                if isinstance(item_dict.get("payload"), str):
+                    item_dict["payload"] = json.loads(item_dict["payload"])
+                active_claims.append(item_dict)
+
             preview = await self.peek_next_item(conn=conn)
 
             return {
@@ -376,6 +391,7 @@ class QueueEngine:
                 "failed_count": counts["failed"] if counts else 0,
                 "total_items": counts["total"] if counts else 0,
                 "active_reviewers": [dict(r) for r in active_revs],
+                "active_claims": active_claims,
                 "next_preview": preview
             }
 

@@ -31,6 +31,7 @@
     leaseTimer: null,
     heartbeatTimer: null,
     walkawayPaused: false,
+    lastActiveClaims: [],
     stats: {
       pending: 0,
       claimed: 0,
@@ -323,9 +324,12 @@
     // Update Roster Card
     updateRosterUI(activeRevs);
 
-    // Update Grid if visible
+    // Update Grid if visible via pushed active claims (100% server push, zero polling)
+    if (s.active_claims) {
+      state.lastActiveClaims = s.active_claims;
+    }
     if (state.currentView === 'grid') {
-      refreshGridStates();
+      updateGridFromActiveClaims(state.lastActiveClaims);
     }
   }
 
@@ -600,19 +604,19 @@
       container.appendChild(card);
     });
 
-    refreshGridStates();
+    updateGridFromActiveClaims(state.lastActiveClaims);
   }
 
-  async function refreshGridStates() {
-    // Fetch active items for all 6 reviewers via REST
-    for (const id of Object.keys(state.gridReviewers)) {
-      try {
-        const res = await fetch(`/api/queue/active/${id}`);
-        const data = await res.json();
-        updateGridReviewerCard(id, data.active_item);
-      } catch (e) {
-        // quiet ignore
+  function updateGridFromActiveClaims(activeClaims) {
+    const claimsByReviewer = {};
+    (activeClaims || []).forEach(item => {
+      if (item && item.claimed_by) {
+        claimsByReviewer[item.claimed_by] = item;
       }
+    });
+
+    for (const id of Object.keys(state.gridReviewers)) {
+      updateGridReviewerCard(id, claimsByReviewer[id] || null);
     }
   }
 

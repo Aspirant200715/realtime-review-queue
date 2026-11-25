@@ -280,20 +280,24 @@ def test_browser_zero_polling_verification(live_server):
         polled_urls = []
 
         def handle_request(req):
-            if "/api/queue/stats" in req.url or "/api/queue/preview" in req.url:
+            if any(endpoint in req.url for endpoint in ["/api/queue/stats", "/api/queue/preview", "/api/queue/active"]):
                 polled_urls.append(req.url)
 
         page.on("request", handle_request)
 
         try:
+            # 1. Test single workstation view
             page.goto(f"{BASE_URL}/?reviewer=reviewer_nopoll")
             page.wait_for_selector(".status-indicator.connected")
 
-            # Wait 3.5 seconds while queue events occur
+            # 2. Switch to 6-Reviewer Grid Mode ("God Mode")
+            page.click("#btn-view-grid")
+
+            # Wait 3.5 seconds while queue events stream in
             httpx.post(f"{BASE_URL}/api/generator/burst", json={"size": 3, "duration": 0.5})
             time.sleep(3.5)
 
-            # VERIFY: Zero polling requests to /api/queue/stats or /api/queue/preview!
+            # VERIFY: Zero polling requests to /api/queue/stats, /api/queue/preview, or /api/queue/active!
             assert len(polled_urls) == 0, f"Frontend is polling! Requests detected: {polled_urls}"
 
         finally:
